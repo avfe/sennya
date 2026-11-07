@@ -142,6 +142,64 @@ pub fn parse(path: &Path) -> Option<ClaudeSession> {
     Some(s)
 }
 
+/// The transcript of a conversation, from whichever project folder holds it.
+pub fn transcript_path(id: &str) -> Option<PathBuf> {
+    let file = format!("{id}.jsonl");
+    let projects = std::fs::read_dir(projects_dir()).ok()?;
+    projects.flatten().map(|p| p.path().join(&file)).find(|p| p.exists())
+}
+
+/// The permission mode a chat was last in. Claude Code records it on every change
+/// (`{"type":"permission-mode","permissionMode":"bypassPermissions"}`) and with each prompt.
+fn last_permission_mode(path: &Path) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    let size = file.metadata().ok()?.len();
+    const TAIL: usize = 256 * 1024;
+    let tail = read_range(&mut file, size.saturating_sub(TAIL as u64), TAIL);
+    tail.lines().rev().filter(|l| l.contains("\"permissionMode\"")).find_map(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).ok()?;
+        Some(v.get("permissionMode")?.as_str()?.to_string())
+    })
+}
+
+/// Options for `claude --resume`: the ones the chat was started with, but in the permission
+/// mode it was last in. Without this a chat in bypass mode comes back asking for
+/// permissions, and every later resume copies that.
+pub fn resume_flags(id: &str, started_with: &[String]) -> Vec<String> {
+    let mode = transcript_path(id).and_then(|p| last_permission_mode(&p));
+    with_permission_mode(started_with, mode)
+}
+
+fn with_permission_mode(started_with: &[String], mode: Option<String>) -> Vec<String> {
+    let Some(mode) = mode else { return started_with.to_vec() };
+    let mut out = Vec::new();
+    let mut it = started_with.iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--dangerously-skip-permissions" => {}
+            "--permission-mode" => {
+                it.next();
+            }
+            _ => out.push(flag.clone()),
+        }
+    }
+    match mode.as_str() {
+        "bypassPermissions" => out.push("--dangerously-skip-permissions".into()),
+        "acceptEdits" | "plan" => out.extend(["--permission-mode".to_string(), mode]),
+        // What Claude starts in without options.
+        "default" | "auto" => {}
+        _ => return started_with.to_vec(),
+    }
+    out
+}
+
+/// The command that reopens a chat, in the permission mode it was last in.
+pub fn resume_command(id: &str) -> String {
+    let mut parts = vec!["claude".to_string(), "--resume".into(), crate::template::local_word(id)];
+    parts.extend(resume_flags(id, &[]).iter().map(|f| crate::template::local_word(f)));
+    parts.join(" ")
+}
+
 /// Cached index; files are re-read only when their size or mtime changes.
 #[derive(Default)]
 pub struct Index {
@@ -186,10 +244,7 @@ impl Index {
 
     /// A conversation by its id, from whichever project folder holds it.
     pub fn find(&mut self, id: &str) -> Option<ClaudeSession> {
-        let file = format!("{id}.jsonl");
-        let projects = std::fs::read_dir(projects_dir()).ok()?;
-        let path = projects.flatten().map(|p| p.path().join(&file)).find(|p| p.exists())?;
-        self.get(&path)
+        self.get(&transcript_path(id)?)
     }
 
     /// The newest conversation for `cwd` written since `since`, skipping `taken` ids.
@@ -208,6 +263,30 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_keeps_the_last_permission_mode() {
+        let strs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let started = strs(&["--model", "opus", "--permission-mode", "plan"]);
+        assert_eq!(with_permission_mode(&started, Some("bypassPermissions".into())), strs(&["--model", "opus", "--dangerously-skip-permissions"]));
+        assert_eq!(with_permission_mode(&strs(&["--dangerously-skip-permissions"]), Some("default".into())), Vec::<String>::new());
+        assert_eq!(with_permission_mode(&started, Some("acceptEdits".into())), strs(&["--model", "opus", "--permission-mode", "acceptEdits"]));
+        assert_eq!(with_permission_mode(&started, None), started);
+        assert_eq!(with_permission_mode(&started, Some("someNewMode".into())), started);
+
+        let dir = std::env::temp_dir().join(format!("sennya-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chat.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"permission-mode\",\"permissionMode\":\"bypassPermissions\"}\n\
+             {\"type\":\"user\",\"permissionMode\":\"plan\",\"message\":{}}\n\
+             {\"type\":\"assistant\",\"message\":{}}\n",
+        )
+        .unwrap();
+        assert_eq!(last_permission_mode(&path).as_deref(), Some("plan"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn parses_transcript() {

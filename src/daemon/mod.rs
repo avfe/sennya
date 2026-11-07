@@ -340,6 +340,10 @@ impl Daemon {
                 if let Some(c) = self.inner.lock().unwrap().clients.get_mut(&client) {
                     c.version = version;
                 }
+                if version >= 4 && session_lost() {
+                    log!("the macOS login session this daemon started in is gone");
+                    let _ = tx.send(ServerMsg::SessionLost);
+                }
             }
             ClientMsg::SetWorkspace(mut ws) => {
                 let state = {
@@ -547,6 +551,9 @@ impl Daemon {
                     inner.ws_dirty = true;
                 }
                 self.broadcast(self.state_msg());
+            }
+            ClientMsg::Ping => {
+                let _ = tx.send(ServerMsg::Pong);
             }
             ClientMsg::SaveAndExit => {
                 log!("restart requested: saving and exiting");
@@ -770,7 +777,8 @@ impl Daemon {
             }
             m.claude_hibernated = false;
             let mut parts = vec!["claude".to_string(), "--resume".into(), crate::template::local_word(&m.claude)];
-            parts.extend(m.claude_flags.iter().map(|f| crate::template::local_word(f)));
+            let flags = crate::claude::resume_flags(&m.claude, &m.claude_flags);
+            parts.extend(flags.iter().map(|f| crate::template::local_word(f)));
             // Claude finds a chat through its project folder, so resume from there.
             let chat_cwd = self.claude.lock().unwrap().find(&m.claude).map(|c| c.cwd).filter(|c| !c.is_empty());
             match chat_cwd {
@@ -1283,4 +1291,18 @@ fn writer(stream: UnixStream, rx: Receiver<ServerMsg>) {
             return;
         }
     }
+}
+
+/// After a logout macOS tears down the login session the daemon was started in, but the
+/// daemon keeps running, like an old tmux server. Shells started from it then reach no
+/// system services (`launchctl managername` fails there, and prints "Aqua" in a live
+/// login session).
+fn session_lost() -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    std::process::Command::new("/bin/launchctl").arg("managername").output().is_ok_and(|out| {
+        let text = [out.stdout, out.stderr].concat();
+        String::from_utf8_lossy(&text).contains("Could not get manager name")
+    })
 }

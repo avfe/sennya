@@ -502,6 +502,120 @@ pub fn set_config_value(section: &str, key: &str, value: Option<&str>) -> std::i
     fs::write(path, new_text)
 }
 
+/// Save `profile` to the config file in place of the `[[profile]]` named `old_name` (a new
+/// one goes at the end), or with `None` remove that profile. Every other line and comment
+/// stays as it is.
+pub fn save_profile(old_name: Option<&str>, profile: Option<&Profile>) -> std::io::Result<()> {
+    let path = paths::config_file();
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => DEFAULT_CONFIG.to_string(),
+        Err(err) => return Err(err),
+    };
+    let new_text = replace_profile(&text, old_name, profile).map_err(std::io::Error::other)?;
+    fs::write(path, new_text)
+}
+
+fn replace_profile(text: &str, old_name: Option<&str>, profile: Option<&Profile>) -> Result<String, String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let header = |l: &str| l.trim_start().starts_with('[');
+    // The lines of the profile to replace: its header up to the next table, without the
+    // blank lines and comments that lead into that table.
+    let mut found: Option<(usize, usize)> = None;
+    if let Some(old) = old_name {
+        let mut i = 0;
+        while i < lines.len() {
+            if lines[i].trim_start().starts_with("[[profile]]") {
+                let mut end = i + 1;
+                while end < lines.len() && !header(lines[end]) {
+                    end += 1;
+                }
+                while end > i + 1 && (lines[end - 1].trim().is_empty() || lines[end - 1].trim_start().starts_with('#')) {
+                    end -= 1;
+                }
+                let name = toml::from_str::<Profile>(&lines[i + 1..end].join("\n")).map(|p| p.name).unwrap_or_default();
+                if name == old {
+                    found = Some((i, end));
+                    break;
+                }
+                i = end;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    let new_block = profile.map(profile_toml);
+    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    match (found, new_block) {
+        (Some((start, end)), Some(block)) => {
+            out.splice(start..end, block.lines().map(String::from));
+        }
+        (Some((start, mut end)), None) => {
+            // Take one blank line along so no double gap is left behind.
+            if out.get(end).is_some_and(|l| l.trim().is_empty()) {
+                end += 1;
+            }
+            out.drain(start..end);
+        }
+        (None, Some(block)) => {
+            while out.last().is_some_and(|l| l.trim().is_empty()) {
+                out.pop();
+            }
+            out.push(String::new());
+            out.extend(block.lines().map(String::from));
+        }
+        (None, None) => {}
+    }
+    let new_text = out.join("\n") + "\n";
+    if let Err(err) = toml::from_str::<Config>(&new_text) {
+        return Err(format!("not changing config.toml, the result would not parse: {err}"));
+    }
+    Ok(new_text)
+}
+
+fn profile_toml(p: &Profile) -> String {
+    let q = |s: &str| toml::Value::String(s.to_string()).to_string();
+    let mut out = vec!["[[profile]]".to_string(), format!("name = {}", q(&p.name))];
+    for (key, value) in [("description", &p.description), ("key", &p.key), ("open", &p.open), ("page", &p.page), ("title", &p.title), ("cwd", &p.cwd)] {
+        if !value.is_empty() {
+            out.push(format!("{key} = {}", q(value)));
+        }
+    }
+    out.push("steps = [".into());
+    for step in &p.steps {
+        let line = match step {
+            Step::Run(run) => q(run),
+            Step::Detailed { run, wait_for, wait_text, delay_ms, timeout_ms, enter } => {
+                let mut parts = Vec::new();
+                if let Some(w) = wait_for.as_deref().filter(|w| !w.is_empty()) {
+                    parts.push(format!("wait_for = {}", q(w)));
+                }
+                if let Some(w) = wait_text.as_deref().filter(|w| !w.is_empty()) {
+                    parts.push(format!("wait_text = {}", q(w)));
+                }
+                if *delay_ms > 0 {
+                    parts.push(format!("delay_ms = {delay_ms}"));
+                }
+                if let Some(t) = timeout_ms {
+                    parts.push(format!("timeout_ms = {t}"));
+                }
+                if *enter == Some(false) {
+                    parts.push("enter = false".into());
+                }
+                if parts.is_empty() {
+                    q(run)
+                } else {
+                    parts.push(format!("run = {}", q(run)));
+                    format!("{{ {} }}", parts.join(", "))
+                }
+            }
+        };
+        out.push(format!("  {line},"));
+    }
+    out.push("]".into());
+    out.join("\n")
+}
+
 pub type Rgb = [u8; 3];
 
 pub fn parse_hex(s: &str) -> Option<Rgb> {
@@ -652,5 +766,34 @@ impl Theme {
                 [v, v, v]
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    fn detailed(run: &str, wait_for: &str) -> Step {
+        Step::Detailed { run: run.into(), wait_for: Some(wait_for.into()), wait_text: None, delay_ms: 0, timeout_ms: None, enter: None }
+    }
+
+    #[test]
+    fn profiles_are_saved_in_place() {
+        let text = "# my config\n[font]\nsize = 14\n\n[[profile]]\nname = \"a\"\nsteps = [\"ls\"]\n\n# about b\n[[profile]]\nname = \"b\"\nsteps = []\n";
+        let p = Profile { name: "a2".into(), key: "cmd+shift+a".into(), steps: vec![Step::Run("ssh -t dev".into()), detailed("cd \"x y\"", "$|%")], ..Default::default() };
+        let out = replace_profile(text, Some("a"), Some(&p)).unwrap();
+        let config: Config = toml::from_str(&out).unwrap();
+        assert_eq!(config.profiles.len(), 2);
+        assert_eq!(config.profiles[0], p);
+        assert_eq!(config.profiles[1].name, "b");
+        assert!(out.starts_with("# my config\n[font]\nsize = 14\n") && out.contains("# about b\n[[profile]]\nname = \"b\""), "{out}");
+
+        let added = replace_profile(&out, None, Some(&Profile { name: "c".into(), ..Default::default() })).unwrap();
+        assert_eq!(toml::from_str::<Config>(&added).unwrap().profiles.last().unwrap().name, "c");
+
+        let removed = replace_profile(&added, Some("a2"), None).unwrap();
+        let names: Vec<String> = toml::from_str::<Config>(&removed).unwrap().profiles.into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["b", "c"]);
+        assert!(removed.contains("# my config") && removed.contains("# about b"));
     }
 }

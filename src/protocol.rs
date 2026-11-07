@@ -11,7 +11,7 @@ use crate::model::{Arrange, SessionId, Workspace};
 
 /// Bumped when messages are added. Variants are only ever appended, so older peers
 /// still understand everything they knew before.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 /// Oldest daemon a window can work with (it then simply misses newer features).
 pub const MIN_DAEMON_VERSION: u32 = 2;
 const MAX_MESSAGE: usize = 64 << 20;
@@ -202,6 +202,9 @@ pub enum ClientMsg {
     /// Save everything and exit, so the next daemon restores it. Unix sends SIGTERM instead,
     /// which older daemons understand too.
     SaveAndExit,
+    // --- protocol 4 ---
+    /// Answered with `Pong`. A window over SSH uses it to notice a dead link in seconds.
+    Ping,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -249,6 +252,12 @@ pub enum ServerMsg {
     // --- protocol 3 ---
     /// Only the lines that changed since the last frame this client received.
     FrameDelta(Box<FrameDelta>),
+    // --- protocol 4 ---
+    Pong,
+    /// The daemon outlived the macOS login session it was started in (the user logged out
+    /// and back in). Its shells can no longer reach system services: DNS, the keychain,
+    /// certificate checks and the clipboard fail in them until it restarts.
+    SessionLost,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

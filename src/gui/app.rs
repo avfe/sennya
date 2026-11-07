@@ -30,6 +30,10 @@ use super::icons::{self, Icon};
 use super::keys::{self, Action, Keymap};
 use super::term_view::{self, mix, DrawOpts, GlyphCache, Metrics, Palette};
 
+#[path = "profile_editor.rs"]
+mod profile_editor;
+use profile_editor::{ProfileEditor, Recording};
+
 const TOPBAR_H: f32 = 36.0;
 const PANE_TITLE_H: f32 = 22.0;
 const TRAFFIC_LIGHTS_W: f32 = 76.0;
@@ -153,6 +157,7 @@ enum Confirm {
     Close { sessions: Vec<SessionId>, what: String },
     KillAll,
     RestartDaemon,
+    SessionLost,
 }
 
 struct Div {
@@ -247,6 +252,13 @@ pub struct App {
     shortcuts: Option<ShortcutsView>,
     /// The inline rename editor was drawn this frame (otherwise the rename is dropped).
     rename_drawn: bool,
+    /// The page whose tab was last scrolled into view.
+    tabs_scrolled_to: Option<u64>,
+    /// The daemon said its macOS login session is gone, and the window offered a restart.
+    session_lost_asked: bool,
+    profile_editor: Option<ProfileEditor>,
+    /// Commands typed in a terminal, on their way to a new profile.
+    recording: Option<Recording>,
 }
 
 struct ShortcutsView {
@@ -257,6 +269,27 @@ struct ShortcutsView {
 
 fn snap(p: Pos2, ppp: f32) -> Pos2 {
     pos2((p.x * ppp).round() / ppp, (p.y * ppp).round() / ppp)
+}
+
+/// Fade a sideways-scrolling strip into `bg` at each edge that has more behind it.
+fn fade_edges<R>(painter: &egui::Painter, out: &egui::scroll_area::ScrollAreaOutput<R>, bg: Color32) {
+    const W: f32 = 28.0;
+    let r = out.inner_rect;
+    let x = out.state.offset.x;
+    let edges = [(x > 0.5, r.left(), r.left() + W), (x + r.width() < out.content_size.x - 0.5, r.right(), r.right() - W)];
+    for (hidden, edge, inner) in edges {
+        if !hidden {
+            continue;
+        }
+        let mut mesh = egui::Mesh::default();
+        for (px, color) in [(edge, bg), (inner, Color32::TRANSPARENT)] {
+            mesh.colored_vertex(pos2(px, r.top()), color);
+            mesh.colored_vertex(pos2(px, r.bottom()), color);
+        }
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(1, 2, 3);
+        painter.add(mesh);
+    }
 }
 
 fn now_millis() -> u128 {
@@ -588,6 +621,10 @@ impl App {
             server_prompt: None,
             shortcuts: None,
             rename_drawn: false,
+            tabs_scrolled_to: None,
+            session_lost_asked: false,
+            profile_editor: None,
+            recording: None,
         }
     }
 
@@ -721,6 +758,15 @@ impl App {
                 ServerMsg::Hello { version, pid } => {
                     self.daemon_pid = Some(pid);
                     self.daemon_outdated = (version < crate::protocol::MIN_DAEMON_VERSION).then_some(pid);
+                }
+                // The reader keeps these for the heartbeat.
+                ServerMsg::Pong => {}
+                ServerMsg::SessionLost => {
+                    // Once per window; reconnects say it again.
+                    if !self.session_lost_asked && self.confirm.is_none() {
+                        self.session_lost_asked = true;
+                        self.confirm = Some(Confirm::SessionLost);
+                    }
                 }
                 ServerMsg::FrameDelta(delta) => {
                     self.frame_arrived.get_or_insert_with(Instant::now);
@@ -1045,6 +1091,7 @@ impl App {
             || self.search.is_some()
             || self.history.is_some()
             || self.profile_prompt.is_some()
+            || self.profile_editor.is_some()
             || self.shortcuts.is_some()
         {
             return None;
@@ -1055,6 +1102,7 @@ impl App {
         }
         let term_mode = self.mode_of(sid);
         if let Some(bytes) = keys::encode_key(event, self.modifiers, term_mode, &self.config.terminal) {
+            self.record_input(sid, &bytes);
             self.send(ClientMsg::Input(sid, bytes));
             self.last_input = Instant::now();
         }
@@ -1513,7 +1561,7 @@ impl App {
             near: None,
             page: None,
             title: Some(cs.title.chars().take(40).collect()),
-            run: vec![format!("claude --resume {}", cs.id)],
+            run: vec![crate::claude::resume_command(&cs.id)],
             prefill: None,
             prefill_after: None,
         };
@@ -1604,7 +1652,9 @@ impl App {
             self.confirm = Some(Confirm::Paste { session: sid, text });
             return;
         }
-        self.send(ClientMsg::Input(sid, keys::paste_bytes(&text, term_mode)));
+        let bytes = keys::paste_bytes(&text, term_mode);
+        self.record_input(sid, &bytes);
+        self.send(ClientMsg::Input(sid, bytes));
         self.last_input = Instant::now();
     }
 
@@ -1750,6 +1800,8 @@ impl App {
         self.switcher_overlay(ctx);
         self.confirm_overlay(ctx);
         self.profile_prompt_overlay(ctx);
+        self.profile_editor_overlay(ctx);
+        self.recording_overlay(ctx);
         self.history_overlay(ctx);
         self.server_overlay(ctx);
         self.shortcuts_overlay(ctx);
@@ -2351,7 +2403,7 @@ impl App {
             if let Some(ClaudeView { id, title, .. }) = claude {
                 let cwd = self.sessions.get(&sid).map(|s| s.info.cwd.clone()).unwrap_or_default();
                 if ui.button("Copy Claude resume command").on_hover_text(title).clicked() {
-                    let cmd = crate::template::cd_then(&cwd, &format!("claude --resume {id}"));
+                    let cmd = crate::template::cd_then(&cwd, &crate::claude::resume_command(&id));
                     if let Some(cb) = self.clipboard() {
                         let _ = cb.set_text(cmd);
                     }
@@ -2408,7 +2460,7 @@ impl App {
                 .map(|(i, p)| (i, p.name.clone(), p.description.clone()))
                 .collect();
             if profiles.is_empty() {
-                ui.label(RichText::new("No profiles yet.\nAdd [[profile]] entries to the config.").color(self.pal.dim));
+                ui.label(RichText::new("No profiles yet.").color(self.pal.dim));
             }
             for (i, name, description) in profiles {
                 if menu_item(ui, &name, self.keymap.label(Action::Profile(i as u16)), &self.pal).on_hover_text(description).clicked() {
@@ -2417,8 +2469,12 @@ impl App {
                 }
             }
             ui.separator();
-            if ui.button("Add or edit profiles…").clicked() {
-                self.do_action(Action::OpenConfig);
+            if ui.button("New profile…").clicked() {
+                self.open_profile_editor(None);
+                ui.close();
+            }
+            if !self.config.profiles.is_empty() && ui.button("Edit profiles…").clicked() {
+                self.open_profile_editor(Some(0));
                 ui.close();
             }
         });
@@ -2482,27 +2538,10 @@ impl App {
         let rect = ui.max_rect();
         let bg = ui.interact(rect, Id::new("topbar-drag"), Sense::click_and_drag());
         self.window_drag(&bg);
-        ui.horizontal_centered(|ui| {
-            if !self.ws.sidebar {
-                ui.add_space((self.traffic_lights_w() - 8.0).max(0.0));
-                let tip = format!("Show sidebar  {}", self.keymap.label(Action::ToggleSidebar));
-                if icons::button(ui, Icon::Sidebar, &pal, tip).clicked() {
-                    self.do_action(Action::ToggleSidebar);
-                }
-                ui.add_space(4.0);
-            }
-            match self.ws.mode {
-                ViewMode::Grid => self.page_tabs(ui, &pal),
-                ViewMode::Tabs => {
-                    if let Some(sid) = self.ws.focused() {
-                        let title = self.title_of(sid);
-                        let sub = self.subtitle_of(sid);
-                        ui.label(RichText::new(title).strong());
-                        ui.label(RichText::new(sub).color(pal.dim).size(11.0));
-                    }
-                }
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        // The buttons on the right go first: the page tabs get the room that is left and
+        // scroll instead of sliding under them.
+        let right = ui
+            .scope_builder(UiBuilder::new().max_rect(rect).layout(Layout::right_to_left(Align::Center)), |ui| {
                 let tip = format!("Search all terminals  {}", self.keymap.label(Action::GlobalSearch));
                 if icons::button(ui, Icon::Search, &pal, tip).clicked() {
                     self.do_action(Action::GlobalSearch);
@@ -2529,7 +2568,31 @@ impl App {
                 if icons::button(ui, Icon::SplitRight, &pal, tip).clicked() {
                     self.do_action(Action::SplitRight);
                 }
-            });
+            })
+            .response
+            .rect;
+        let left = Rect::from_min_max(rect.min, pos2((right.left() - 8.0).max(rect.left()), rect.bottom()));
+        ui.scope_builder(UiBuilder::new().max_rect(left).layout(Layout::left_to_right(Align::Center)), |ui| {
+            ui.set_clip_rect(left.intersect(ui.clip_rect()));
+            if !self.ws.sidebar {
+                ui.add_space((self.traffic_lights_w() - 8.0).max(0.0));
+                let tip = format!("Show sidebar  {}", self.keymap.label(Action::ToggleSidebar));
+                if icons::button(ui, Icon::Sidebar, &pal, tip).clicked() {
+                    self.do_action(Action::ToggleSidebar);
+                }
+                ui.add_space(4.0);
+            }
+            match self.ws.mode {
+                ViewMode::Grid => self.page_tabs(ui, &pal),
+                ViewMode::Tabs => {
+                    if let Some(sid) = self.ws.focused() {
+                        let title = self.title_of(sid);
+                        let sub = self.subtitle_of(sid);
+                        ui.add(egui::Label::new(RichText::new(title).strong()).truncate());
+                        ui.add(egui::Label::new(RichText::new(sub).color(pal.dim).size(11.0)).truncate());
+                    }
+                }
+            }
         });
     }
 
@@ -2537,77 +2600,99 @@ impl App {
         let pages: Vec<(usize, u64, String, Vec<SessionId>)> =
             self.ws.pages.iter().enumerate().map(|(i, p)| (i, p.id, p.name.clone(), p.sessions())).collect();
         let many = pages.len() > 1;
-        for (i, page_id, name, sids) in pages {
-            let active = i == self.ws.active_page;
-            // Even padding on both sides; the count sits right after the name and turns into
-            // the close button on hover, so no space is reserved for it.
-            let font = self.font(self.ui_size());
-            let count = sids.len().to_string();
-            let (name_w, count_w) = ui.fonts_mut(|f| {
-                (
-                    f.layout_no_wrap(name.clone(), font.clone(), pal.text).size().x,
-                    f.layout_no_wrap(count.clone(), font.clone(), pal.text).size().x,
-                )
-            });
-            const PAD: f32 = 12.0;
-            const GAP: f32 = 8.0;
-            let slot_w = count_w.max(14.0);
-            let renaming = matches!(&self.rename, Some(Rename { place: RenamePlace::Tabs, target: RenameTarget::Page(p), .. }) if *p == page_id);
-            let natural = PAD + name_w + GAP + slot_w + PAD;
-            let width = if renaming { natural.max(160.0) } else { natural };
-            let (rect, resp) = ui.allocate_exact_size(vec2(width, 28.0), Sense::click());
-            if self.inline_rename(ui, rect, &RenameTarget::Page(page_id), RenamePlace::Tabs) {
-                continue;
-            }
-            let painter = ui.painter();
-            let hovered = resp.hovered();
-            if self.drag_pane.is_some() && resp.contains_pointer() {
-                self.page_drop = Some(i);
-                painter.rect_stroke(rect, 7.0, Stroke::new(1.5, pal.accent), StrokeKind::Inside);
-            }
-            if active {
-                painter.rect_filled(rect, 7.0, pal.panel_active);
-            } else if hovered {
-                painter.rect_filled(rect, 7.0, pal.panel_hover);
-            }
-            let name_color = if active { pal.text } else { pal.dim };
-            painter.text(pos2(rect.left() + PAD, rect.center().y), Align2::LEFT_CENTER, &name, font.clone(), name_color);
-            let slot_center = pos2(rect.right() - PAD - slot_w / 2.0, rect.center().y);
-            let close = Rect::from_center_size(slot_center, vec2(18.0, 18.0));
-            let over_close = many && hovered && resp.hover_pos().is_some_and(|p| close.contains(p));
-            if many && hovered {
-                if over_close {
-                    painter.rect_filled(close, 4.0, mix(pal.panel, pal.danger, 0.25));
-                }
-                icons::paint(painter, Icon::Close, close.center(), if over_close { pal.danger } else { pal.dim });
-            } else {
-                painter.text(slot_center, Align2::CENTER_CENTER, &count, font, mix(name_color, pal.panel, 0.35));
-            }
-            if hovered {
-                resp.clone().on_hover_text(format!("{}\nDouble-click to rename · drop a terminal here to move it", self.keymap.label(Action::GotoPage((i + 1).min(9) as u8))));
-            }
-            if resp.clicked() {
-                if resp.interact_pointer_pos().is_some_and(|p| many && close.contains(p)) {
-                    self.request_close(sids.clone());
-                } else {
-                    self.ws.active_page = i;
-                    self.ws_dirty = true;
-                }
-            }
-            if resp.double_clicked() {
-                self.start_rename(Rename { place: RenamePlace::Tabs, target: RenameTarget::Page(page_id), text: name.clone(), focus: true });
-            }
-            resp.context_menu(|ui| {
-                if ui.button("Rename page").clicked() {
-                    self.start_rename(Rename { place: RenamePlace::Tabs, target: RenameTarget::Page(page_id), text: name.clone(), focus: true });
-                    ui.close();
-                }
-                if ui.button(RichText::new("Close page").color(self.pal.danger)).clicked() {
-                    self.request_close(sids.clone());
-                    ui.close();
-                }
-            });
-        }
+        // Room for the + button, which stays right after the tabs.
+        let max_w = (ui.available_width() - 28.0 - ui.spacing().item_spacing.x).max(0.0);
+        let scroll = ui
+            .scope(|ui| {
+                // A plain mouse wheel scrolls the tabs sideways too.
+                ui.style_mut().always_scroll_the_only_direction = true;
+                egui::ScrollArea::horizontal()
+                    .id_salt("page-tabs")
+                    .max_width(max_w)
+                    .auto_shrink([true, false])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .show(ui, |ui| {
+                        ui.horizontal_centered(|ui| {
+                            for (i, page_id, name, sids) in pages {
+                                let active = i == self.ws.active_page;
+                                // Even padding on both sides; the count sits right after the name and turns into
+                                // the close button on hover, so no space is reserved for it.
+                                let font = self.font(self.ui_size());
+                                let count = sids.len().to_string();
+                                let (name_w, count_w) = ui.fonts_mut(|f| {
+                                    (
+                                        f.layout_no_wrap(name.clone(), font.clone(), pal.text).size().x,
+                                        f.layout_no_wrap(count.clone(), font.clone(), pal.text).size().x,
+                                    )
+                                });
+                                const PAD: f32 = 12.0;
+                                const GAP: f32 = 8.0;
+                                let slot_w = count_w.max(14.0);
+                                let renaming = matches!(&self.rename, Some(Rename { place: RenamePlace::Tabs, target: RenameTarget::Page(p), .. }) if *p == page_id);
+                                let natural = PAD + name_w + GAP + slot_w + PAD;
+                                let width = if renaming { natural.max(160.0) } else { natural };
+                                let (rect, resp) = ui.allocate_exact_size(vec2(width, 28.0), Sense::click());
+                                if active && self.tabs_scrolled_to != Some(page_id) {
+                                    ui.scroll_to_rect(rect, None);
+                                    self.tabs_scrolled_to = Some(page_id);
+                                }
+                                if self.inline_rename(ui, rect, &RenameTarget::Page(page_id), RenamePlace::Tabs) {
+                                    continue;
+                                }
+                                let painter = ui.painter();
+                                let hovered = resp.hovered();
+                                if self.drag_pane.is_some() && resp.contains_pointer() {
+                                    self.page_drop = Some(i);
+                                    painter.rect_stroke(rect, 7.0, Stroke::new(1.5, pal.accent), StrokeKind::Inside);
+                                }
+                                if active {
+                                    painter.rect_filled(rect, 7.0, pal.panel_active);
+                                } else if hovered {
+                                    painter.rect_filled(rect, 7.0, pal.panel_hover);
+                                }
+                                let name_color = if active { pal.text } else { pal.dim };
+                                painter.text(pos2(rect.left() + PAD, rect.center().y), Align2::LEFT_CENTER, &name, font.clone(), name_color);
+                                let slot_center = pos2(rect.right() - PAD - slot_w / 2.0, rect.center().y);
+                                let close = Rect::from_center_size(slot_center, vec2(18.0, 18.0));
+                                let over_close = many && hovered && resp.hover_pos().is_some_and(|p| close.contains(p));
+                                if many && hovered {
+                                    if over_close {
+                                        painter.rect_filled(close, 4.0, mix(pal.panel, pal.danger, 0.25));
+                                    }
+                                    icons::paint(painter, Icon::Close, close.center(), if over_close { pal.danger } else { pal.dim });
+                                } else {
+                                    painter.text(slot_center, Align2::CENTER_CENTER, &count, font, mix(name_color, pal.panel, 0.35));
+                                }
+                                if hovered {
+                                    resp.clone().on_hover_text(format!("{}\nDouble-click to rename · drop a terminal here to move it", self.keymap.label(Action::GotoPage((i + 1).min(9) as u8))));
+                                }
+                                if resp.clicked() {
+                                    if resp.interact_pointer_pos().is_some_and(|p| many && close.contains(p)) {
+                                        self.request_close(sids.clone());
+                                    } else {
+                                        self.ws.active_page = i;
+                                        self.ws_dirty = true;
+                                    }
+                                }
+                                if resp.double_clicked() {
+                                    self.start_rename(Rename { place: RenamePlace::Tabs, target: RenameTarget::Page(page_id), text: name.clone(), focus: true });
+                                }
+                                resp.context_menu(|ui| {
+                                    if ui.button("Rename page").clicked() {
+                                        self.start_rename(Rename { place: RenamePlace::Tabs, target: RenameTarget::Page(page_id), text: name.clone(), focus: true });
+                                        ui.close();
+                                    }
+                                    if ui.button(RichText::new("Close page").color(self.pal.danger)).clicked() {
+                                        self.request_close(sids.clone());
+                                        ui.close();
+                                    }
+                                });
+                            }
+                        });
+                    })
+            })
+            .inner;
+        fade_edges(ui.painter(), &scroll, pal.panel);
         let tip = format!("New page  {}", self.keymap.label(Action::NewPage));
         if icons::button(ui, Icon::Plus, pal, tip).clicked() {
             self.do_action(Action::NewPage);
@@ -3545,6 +3630,11 @@ impl App {
                 "All shells and programs stop and saved sessions are deleted.".to_string(),
                 "Kill all",
             ),
+            Confirm::SessionLost => (
+                "Terminals lost access to macOS".to_string(),
+                "The session daemon has been running since before you last logged out of macOS, so its terminals cannot reach system services: DNS, the keychain, certificate checks (gh, git, curl) and the clipboard fail in them.\n\nRestart it to fix this. Terminals come back in their folders with their history and Claude chats resume; programs running in them stop.".to_string(),
+                "Restart",
+            ),
             Confirm::RestartDaemon => (
                 "Restart the session daemon?".to_string(),
                 "Applies an update of sennya. Terminals come back in their folders with their history; programs running in them stop. Claude chats reopen when you look at their terminals.".to_string(),
@@ -3588,7 +3678,7 @@ impl App {
                     self.send(ClientMsg::Shutdown);
                     self.quit = true;
                 }
-                Confirm::RestartDaemon => {
+                Confirm::RestartDaemon | Confirm::SessionLost => {
                     self.daemon_outdated = self.daemon_outdated.or(self.daemon_pid);
                     self.restart_daemon();
                 }
@@ -3745,7 +3835,7 @@ impl App {
                             ui.close();
                         }
                         if ui.button("Copy resume command").clicked() {
-                            let cmd = crate::template::cd_then(&c.cwd, &format!("claude --resume {}", c.id));
+                            let cmd = crate::template::cd_then(&c.cwd, &crate::claude::resume_command(&c.id));
                             if let Ok(mut cb) = arboard::Clipboard::new() {
                                 let _ = cb.set_text(cmd);
                             }

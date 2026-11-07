@@ -442,7 +442,7 @@ pub fn run(cmd: &str, mut args: Vec<String>) -> Result<bool> {
                 cwd: Some(s.cwd.clone()),
                 open: "tab".into(),
                 title: Some(s.title.chars().take(40).collect()),
-                run: vec![format!("claude --resume {}", s.id)],
+                run: vec![crate::claude::resume_command(&s.id)],
                 ..Default::default()
             };
             c.send(ClientMsg::Spawn { req: 2, spec })?;
