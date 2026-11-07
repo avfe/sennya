@@ -194,9 +194,11 @@ impl App {
                 ui.label(RichText::new("one shortcut opens a terminal and types your commands").color(pal.dim));
             });
             ui.add_space(12.0);
-            ui.horizontal_top(|ui| {
+            const LIST_W: f32 = 180.0;
+            const GAP: f32 = 24.0;
+            let row = ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
-                    ui.set_width(180.0);
+                    ui.set_width(LIST_W);
                     for (i, name) in names.iter().enumerate() {
                         let current = ed.original.as_deref() == Some(name.as_str());
                         if ui.selectable_label(current, name).clicked() && !current {
@@ -216,9 +218,14 @@ impl App {
                         action = Some(EditorAction::AskClaude);
                     }
                 });
-                ui.separator();
+                // Not `ui.separator()`: in a row it takes all the height on offer, and a modal
+                // offers its own last height, so it would grow every frame.
+                ui.add_space(GAP);
                 ui.vertical(|ui| profile_form(ui, &mut ed, &pal));
             });
+            let rect = row.response.rect;
+            let x = rect.left() + LIST_W + GAP / 2.0;
+            ui.painter().vline(x, rect.y_range(), Stroke::new(1.0, mix(pal.panel, pal.fg, 0.12)));
             ui.add_space(8.0);
             if let Some(err) = &ed.error {
                 ui.label(RichText::new(err).color(pal.danger));
