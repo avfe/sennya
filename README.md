@@ -1,173 +1,231 @@
 # sennya
 
-Терминал на Rust с GPU-рендерингом (wgpu/Metal). Сессии живут в отдельном фоновом процессе, поэтому
-закрытие, `kill -9` или падение окна не убивает ни один шелл. Даже если умер сам daemon (или
-перезагрузился Mac), терминалы восстанавливаются с историей и раскладкой.
+**English** | [Русский](README.ru.md)
 
-## Возможности
+A fast terminal written in Rust with GPU rendering (wgpu/Metal). Sessions live in a separate
+background process, so closing the window, `kill -9` or a crash of the window never kills a shell.
+Even if the daemon itself dies (or the Mac restarts), terminals come back with their history and
+layout. It is built for working with AI agents: Claude Code sessions are tracked, resumed after
+restarts, and Claude can drive the terminal through a CLI.
 
-- **Два режима** (`⌘G` — переключение):
-  - **Tabs**: вертикальные вкладки слева, справа один терминал на весь экран.
-  - **Grid**: все терминалы страницы видны сразу. Новый терминал сам встраивается в сетку,
-    разделители двигаются мышью, панели перетаскиваются за заголовок (к краю другой панели или
-    в центр, чтобы поменять их местами).
-- **Страницы**: отдельные сетки терминалов (`⌘N`, `⌘1…9`, `⌥⌘[` / `⌥⌘]`). Терминал можно перетащить на
-  вкладку страницы или в её заголовок в сайдбаре.
-- **Раскладки страницы**: Grid / Columns / Rows / Main + stack / Manual. Grid, Columns и Rows
-  перестраиваются автоматически; если подвинуть разделитель, страница переходит в Manual.
-- **Области**: правый клик по панели → «New terminals open in this area». После этого `⌘T` добавляет
-  терминалы в группу этой панели.
-- **Поиск**: `⌘F` ищет в текущем терминале, `⌘⇧F` — по истории всех терминалов на всех страницах,
-  `⌘P` — быстрый переход к терминалу по названию или папке.
-- **Буфер обмена**: `⌘C` / `⌘V`; bracketed paste с защитой от подмены; подтверждение перед вставкой
-  нескольких строк в «голый» шелл.
-- **Скриншоты и картинки**: `⌘V` с картинкой в буфере (например, после `⌘⌃⇧4`) сохраняет её в PNG и
-  вставляет путь. Claude Code показывает такую вставку как `[Image #1]`. `⌃V` уходит в программу как
-  есть, поэтому родная вставка картинок в Claude Code тоже работает.
-- **Drag & drop файлов** в окно вставляет экранированные пути.
-- **Кликабельные ссылки**: `⌘`+клик. Работают обычные URL (в том числе перенесённые на следующую
-  строку) и OSC 8 hyperlinks.
-- **Shift+Enter** вставляет перевод строки в Claude Code без отправки сообщения.
-- Колесо мыши, выделение (двойной клик — слово, тройной — строка, `⌥`+drag — блок), mouse reporting
-  для vim/htop, focus events, «natural text editing» на macOS (`⌥←`, `⌘←`, `⌘⌫`), работа сочетаний
-  на русской раскладке.
-- Индикаторы активности и колокольчика на вкладках, переименование (`F2` или двойной клик).
-- **Множественный выбор**: зажмите терминал в списке (или `⌘`+клик) — появятся галочки и панель
-  «Close N / Move to / All / Done». `Esc` выходит из выбора.
-- **Сворачиваемые страницы** в сайдбаре (клик по заголовку страницы), свёрнутость запоминается.
-- Сайдбар скрывается кнопкой `«` (показывается обратно `»`) или `⌘B`.
-- Flat-дизайн: панели сетки без рамок и заголовков, разделены линией в 1 px, активная отмечена
-  полоской сверху. Плашка «перетащить / развернуть / закрыть» появляется при наведении на верх панели.
+macOS is the main platform; Windows builds work too (see [Windows](#windows)).
 
-## Профили, агенты и Claude Code
+## Install
 
-- **Профили** (`[[profile]]` в конфиге): одна горячая клавиша открывает терминал (вкладка, сплит,
-  стопка или новая страница) и выполняет шаги — например `ssh dev`, переход в новую папку
-  `task_{uuid}`, запуск `claude`. Шаг может ждать промпт (`wait_for = "$|%|#"`) или текст на экране.
-  Подстановки: `{uuid}` `{short}` `{words}` `{timestamp}` `{date}` `{cwd_name}` `{env:NAME}`,
-  `{prompt:Вопрос}` спрашивается при запуске, `|q` экранирует значение для shell.
-  Запуск: горячая клавиша, `⌘P`, меню ⚙ → Profiles или `sennya run имя`.
-- **CLI для агентов** (JSON): `sennya list / new / claude / run / send / read / focus / hide /
-  show / close / layout / history / resume`. Внутри терминала sennya `current` означает этот
-  терминал. Например, Claude сам открывает задачу рядом с собой:
-  `sennya claude --near current --open stack --skip-permissions "текст задачи"`.
-  Полная инструкция для агента: `sennya help agents` (это `AGENTS.md`).
-- **Чаты Claude Code** (`⇧⌘H`): все разговоры с заголовками, папкой, веткой и временем; клик
-  открывает `claude --resume <id>` в новом терминале. Терминал помнит, какой чат в нём шёл,
-  а после перезагрузки или падения daemon чат возобновляется сам (`persistence.resume_claude`).
-- **Скрытые терминалы** (`⇧⌘M` или «—» на плашке панели): продолжают работать, видны приглушёнными
-  в сайдбаре и в полоске под сеткой с индикатором активности; клик возвращает их в сетку.
-- **Несколько окон** (`⇧⌘N`): каждое окно показывает свою страницу и свой режим, раскладка общая.
-- **Режим фокуса** (`⌃⌘F`): полноэкранный режим без сайдбара и панелей — только терминалы.
-- Тема **true-black** (чистый чёрный для OLED) — в меню ⚙ → Theme.
+**From a release.** Download the archive for your system from
+[Releases](https://github.com/avfe/sennya/releases):
 
-## Серверы
+- **macOS**: `Sennya-macos-universal.zip`. Unzip it and double-click `install.command`. It copies
+  `Sennya.app` to `/Applications`, puts the `sennya` command on your `PATH` and installs the Claude
+  Code skill. The app is not notarized, so if you open `Sennya.app` directly the first time, use
+  right-click → Open.
+- **Windows**: `sennya-windows-x64.zip`. Unzip it and run
+  `powershell -ExecutionPolicy Bypass -File install-windows.ps1`. It installs to
+  `%LOCALAPPDATA%\Programs\sennya`, adds it to `PATH` and creates a Start menu shortcut.
 
-На сервере может работать свой daemon sennya: тогда терминалы живут там и переживают обрыв
-сети, сон ноутбука и перезапуск окна.
-
-```sh
-sennya remote install dev   # один раз: поставить daemon на сервер (любой хост для `ssh`)
-sennya remote dev           # открыть окно сервера; при обрыве оно переподключается само
-```
-
-Связь идёт обычным `ssh dev sennya proxy`, поэтому ключи, `~/.ssh/config` и jump-хосты
-работают как обычно (вход должен быть без пароля: ключ или ssh-agent). По сети передаются
-только изменившиеся строки экрана. На Mac-сервер копируется готовый бинарник, на Linux daemon
-собирается из исходников (`--install-rust` поставит Rust через rustup, без sudo). В меню ⚙ →
-Servers есть список серверов из `[[remote]]` в конфиге и «Connect to a server…».
-
-## Производительность
-
-- Терминалы эмулирует daemon (`alacritty_terminal`). GUI получает кадры **только для видимых**
-  терминалов и не больше ~140 раз в секунду, поэтому 50 открытых сессий почти ничего не стоят.
-- В простое оба процесса потребляют 0% CPU: перерисовка происходит только по событиям.
-- В тесте (debug-сборка) `seq 1 300000` обработался меньше чем за секунду. Пик CPU: GUI 10%,
-  daemon 55%, затем сразу 0%.
-
-## Безопасность
-
-- Сокет и все файлы приватные (`0700`/`0600`), daemon проверяет UID подключившегося процесса.
-- Программы могут только записывать в буфер обмена (OSC 52), чтение запрещено.
-- Bracketed paste нельзя «закрыть» изнутри вставляемого текста.
-- Ссылки открываются только для http/https/file/ftp/mailto.
-- Сохранение scrollback на диск можно выключить (`persistence.save_scrollback = false`).
-
-## Установка
+**From source** (macOS, needs Rust):
 
 ```sh
 ./scripts/install-macos.sh
 ```
 
-Скрипт собирает `Sennya.app`, кладёт его в `/Applications`, делает команду `sennya` доступной
-в `PATH` и устанавливает skill для Claude Code (`~/.claude/skills/sennya`), чтобы Claude умел
-управлять терминалом. Откатить: `rm -rf /Applications/Sennya.app /opt/homebrew/bin/sennya ~/.claude/skills/sennya`.
+The script builds `Sennya.app`, puts it in `/Applications`, makes the `sennya` command available
+on your `PATH` and installs the skill for Claude Code. To undo:
+`rm -rf /Applications/Sennya.app /opt/homebrew/bin/sennya ~/.claude/skills/sennya`.
 
-После обновления версии окно попросит перезапустить daemon. Терминалы вернутся в тех же папках
-с историей, но запущенные в них программы остановятся; чаты Claude Code можно вернуть через `⇧⌘H`.
+**The Claude Code skill comes with every install.** It lives in `~/.claude/skills/sennya` and
+teaches Claude to open terminals, run tasks next to itself, write profiles and change settings.
+The daemon refreshes it on every start whenever `~/.claude` exists, and `sennya install-skill`
+installs it by hand.
 
 ```
-sennya            открыть окно (daemon стартует сам)
-sennya --help     все команды CLI
-sennya kill       остановить daemon и все терминалы
+sennya            open a window (the daemon starts by itself)
+sennya --help     every CLI command
+sennya kill       stop the daemon and every terminal
 ```
 
-## Настройка
+After an update the window offers to restart the daemon. Terminals come back in the same folders
+with their history and Claude Code chats resume; other programs running in them stop.
 
-`~/.config/sennya/config.toml` создаётся при первом запуске с комментариями и подхватывается
-на лету. Там настраиваются шрифт (цепочка семейств), тема (10 встроенных, можно переопределить
-любой цвет), шелл, переменные окружения, курсор, `option_as_alt`, поведение вставки картинок,
-сохранение истории и любые сочетания клавиш (`[keys]`). Тему можно сменить и через меню ⚙.
+## Features
 
-## Горячие клавиши (macOS)
+- **Two modes** (`⌘G` switches):
+  - **Grid**: every terminal of a page is visible at once. A new terminal fits itself into the
+    grid, dividers move with the mouse, and panes are dragged by their header (to the edge of
+    another pane, or onto its center to swap the two).
+  - **Tabs**: vertical tabs on the left, one terminal filling the window on the right.
+- **Pages**: separate grids of terminals (`⌘N`, `⌘1…9`, `⌥⌘[` / `⌥⌘]`). Drag a terminal onto a page
+  tab or onto the page header in the sidebar to move it. When there are more pages than fit, the
+  tabs scroll sideways.
+- **Page layouts**: Grid / Columns / Rows / Main + stack / Manual. Grid, Columns and Rows re-tile
+  automatically; moving a divider switches the page to Manual.
+- **Areas**: right-click a pane → "New terminals open in this area". After that `⌘T` adds terminals
+  to that pane's group.
+- **Search**: `⌘F` searches the current terminal, `⌘⇧F` the history of every terminal on every page,
+  `⌘P` jumps to a terminal by name or folder (and runs profiles).
+- **Clipboard**: `⌘C` / `⌘V`; bracketed paste that can't be broken out of; a confirmation before
+  pasting several lines into a bare shell.
+- **Screenshots and images**: `⌘V` with an image on the clipboard (after `⌘⌃⇧4`, say) saves it as a
+  PNG and pastes the path. Claude Code shows such a paste as `[Image #1]`. `⌃V` goes to the program
+  as is, so Claude Code's own image paste works too.
+- **Drag and drop files** into the window to paste their escaped paths.
+- **Clickable links**: `⌘`+click. Plain URLs (including ones wrapped onto the next line) and OSC 8
+  hyperlinks.
+- **Shift+Enter** inserts a newline in Claude Code without sending the message.
+- Mouse wheel, selection (double click selects a word, triple a line, `⌥`+drag a block), mouse
+  reporting for vim/htop, focus events, macOS "natural text editing" (`⌥←`, `⌘←`, `⌘⌫`), and
+  shortcuts that work on non-Latin keyboard layouts.
+- Activity and bell indicators on tabs, renaming (`F2` or double click).
+- **Multi-select**: press and hold a terminal in the list (or `⌘`+click) to get checkboxes and a
+  "Close N / Move to / All / Done" bar. `Esc` leaves the selection.
+- **Collapsible pages** in the sidebar (click the page header); collapsed pages are remembered.
+- The sidebar hides with the `«` button (and comes back with `»`) or `⌘B`.
+- Flat design: grid panes have no frames or headers, they are separated by a 1 px line and the
+  active one is marked with a bar on top. A "drag / maximize / close" handle appears when you hover
+  the top of a pane.
 
-Любое сочетание меняется в ⚙ → Keyboard shortcuts: кликните по сочетанию и нажмите новое
-(Esc отменяет, ⌫ снимает, Reset возвращает исходное). Изменения пишутся в `[keys]` конфига.
+## Profiles
 
-| Действие | Клавиши |
+A profile turns one shortcut into a recipe: it opens a terminal (a tab, a split, the stack or a new
+page) and types commands, waiting for a prompt or for text on the screen between them. For
+example: `ssh dev`, a fresh `task_{uuid}` folder, then `claude` with the task you type in.
+
+Three ways to make one, all in ⚙ → Profiles:
+
+- **The editor** (New profile… / Edit profiles…): name, shortcut, where it opens, the folder and the
+  commands. For each command you choose when it is typed: once the shell is ready, right after the
+  previous one, after a prompt (`$`, `%`, `#`, `>`) or after some text appears. "Save and run" tries
+  it at once.
+- **Recording**: press "Record from a terminal", type your commands in the focused terminal as
+  usual, then press "Stop and edit". Each command becomes a step that waits for the prompt it was
+  typed at. Passwords are never recorded, because the terminal does not show them.
+- **Describe it to Claude**: opens Claude Code next to you with the request started. Say in your own
+  words what the profile should do, and Claude writes it into the config with the sennya skill.
+
+Placeholders: `{uuid}` `{short}` `{words}` `{timestamp}` `{date}` `{time}` `{cwd}` `{cwd_name}`
+`{home}` `{env:NAME}`. `{prompt:Question}` is asked when the profile runs, and `|q` quotes a value for
+the shell. Run a profile with its shortcut, from `⌘P`, from ⚙ → Profiles or with `sennya run name`.
+Profiles are stored as `[[profile]]` entries in the config, so you can edit them there too.
+
+## Agents and Claude Code
+
+- **A CLI for agents** (JSON output): `sennya list / new / claude / run / send / read / focus / hide /
+  show / close / layout / history / resume`. Inside a sennya terminal, `current` means that terminal.
+  For example, Claude opens a task next to itself:
+  `sennya claude --near current --open stack --skip-permissions "the task"`.
+  The full guide for agents is `sennya help agents` (that is `AGENTS.md`).
+- **Claude Code chats** (`⇧⌘H`): every conversation with its title, folder, branch and time; a click
+  opens `claude --resume <id>` in a new terminal. A terminal remembers which chat ran in it, and
+  after a restart or a crash of the daemon the chat resumes by itself
+  (`persistence.resume_claude`), in the permission mode it was in (bypass stays bypass).
+- **Hidden terminals** (`⇧⌘M` or "—" on the pane handle) keep running. They are shown dimmed in the
+  sidebar and in a strip under the grid with an activity indicator; a click brings them back.
+- **Several windows** (`⇧⌘N`): each window shows its own page and mode, the layout is shared.
+- **Focus mode** (`⌃⌘F`): fullscreen with no sidebar or bars, only terminals.
+- The **true-black** theme (pure black for OLED) is in ⚙ → Theme.
+
+## Servers
+
+A server can run its own sennya daemon. Its terminals then live on the server and survive network
+drops, laptop sleep and restarts of the window, with nothing but SSH: no UDP ports as with mosh.
+
+```sh
+sennya remote install dev   # once: put the daemon on the server (any host you can `ssh` to)
+sennya remote dev           # open a window attached to it; it reconnects by itself
+```
+
+- The window pings the server every 2 seconds. When the network drops (a Wi-Fi switch, a VPN,
+  sleep) it notices within about 6 seconds and keeps reconnecting until the server is back. Every
+  terminal is where you left it: the shells never noticed.
+- The link is plain `ssh dev sennya proxy`, so keys, `~/.ssh/config` and jump hosts work as usual.
+  It must log in without a password prompt (a key or ssh-agent). Only changed screen lines travel
+  over the network.
+- A Mac server gets a copy of this binary; on Linux the daemon is built from source
+  (`--install-rust` installs Rust with rustup, no sudo).
+- ⚙ → Servers lists the servers from `[[remote]]` in the config and has "Connect to a server…".
+
+## Windows
+
+`sennya.exe` is the same program: the daemon (ConPTY sessions over an AF_UNIX socket), the window
+and the CLI. The default shell is PowerShell; `Ctrl+C` copies when text is selected and interrupts
+otherwise, `Ctrl+V` pastes. To cross-compile from a Mac: `./scripts/build-windows.sh` (needs
+[llvm-mingw](https://github.com/mstorsjo/llvm-mingw)).
+
+## Performance
+
+- The daemon emulates the terminals (`alacritty_terminal`). The window gets frames **only for
+  visible** terminals and at most ~140 times a second, so 50 open sessions cost next to nothing.
+- Idle, both processes use 0% CPU: drawing happens only on events.
+- In a test (debug build) `seq 1 300000` finished in under a second. Peak CPU: window 10%, daemon
+  55%, then 0% right after.
+
+## Security
+
+- The socket and every file are private (`0700`/`0600`), and the daemon checks the UID of whoever
+  connects.
+- Programs can only write to the clipboard (OSC 52); reading it is not allowed.
+- Bracketed paste can't be "closed" from inside the pasted text.
+- Links open only for http/https/file/ftp/mailto.
+- Saving scrollback to disk can be turned off (`persistence.save_scrollback = false`).
+- If the daemon outlives your macOS login session (you logged out and back in), its terminals can no
+  longer reach system services such as DNS, the keychain and certificate checks. The window notices
+  and offers to restart it.
+
+## Configuration
+
+`~/.config/sennya/config.toml` is created on the first start with comments, and changes apply as
+soon as you save. It sets the font (a chain of families), the theme (11 built in, any color can be
+overridden), the shell, environment variables, the cursor, `option_as_alt`, how images are pasted,
+saving history, profiles and any shortcut (`[keys]`). The theme can also be changed from the ⚙ menu.
+
+## Shortcuts (macOS)
+
+Change any of them in ⚙ → Keyboard shortcuts: click a shortcut and press the new one (Esc cancels,
+⌫ removes it, Reset restores the default). Changes are written to `[keys]` in the config.
+
+| Action | Keys |
 |---|---|
-| Новый терминал | `⌘T` |
-| Закрыть терминал | `⌘W` |
-| Разделить вправо / вниз | `⌘D` / `⌘⇧D` |
+| New terminal | `⌘T` |
+| Close terminal | `⌘W` |
+| Split right / down | `⌘D` / `⌘⇧D` |
 | Tabs ↔ Grid | `⌘G` |
-| Новая страница / закрыть страницу | `⌘N` / `⌘⇧W` |
-| Страница 1…9, следующая/предыдущая | `⌘1…9`, `⌥⌘]` / `⌥⌘[` |
-| Следующий/предыдущий терминал | `⇧⌘]` / `⇧⌘[` |
-| Фокус соседней панели | `⌘⌥←↑→↓` |
-| Развернуть панель | `⌘⇧↩` |
-| Выровнять сетку | `⌘⇧R` |
-| Сайдбар | `⌘B` |
-| Поиск / по всем / переход | `⌘F` / `⌘⇧F` / `⌘P` |
-| Очистить историю | `⌘K` |
-| Размер шрифта | `⌘=` / `⌘-` / `⌘0` |
-| Переименовать | `F2` |
-| Конфиг | `⌘,` |
-| Скрыть панель (продолжает работать) | `⇧⌘M` |
-| Чаты Claude Code | `⇧⌘H` |
-| Новое окно | `⇧⌘N` |
-| Режим фокуса (полный экран) | `⌃⌘F` |
-| Выйти (терминалы продолжают жить) | `⌘Q` |
+| New page / close page | `⌘N` / `⌘⇧W` |
+| Page 1…9, next/previous | `⌘1…9`, `⌥⌘]` / `⌥⌘[` |
+| Next/previous terminal | `⇧⌘]` / `⇧⌘[` |
+| Focus the neighboring pane | `⌘⌥←↑→↓` |
+| Maximize pane | `⌘⇧↩` |
+| Rebalance the grid | `⌘⇧R` |
+| Sidebar | `⌘B` |
+| Find / in all / jump | `⌘F` / `⌘⇧F` / `⌘P` |
+| Clear history | `⌘K` |
+| Font size | `⌘=` / `⌘-` / `⌘0` |
+| Rename | `F2` |
+| Config | `⌘,` |
+| Hide pane (keeps running) | `⇧⌘M` |
+| Claude Code chats | `⇧⌘H` |
+| New window | `⇧⌘N` |
+| Focus mode (fullscreen) | `⌃⌘F` |
+| Quit (terminals keep running) | `⌘Q` |
 
-## Архитектура
+## Architecture
 
 ```
- GUI (winit + wgpu + egui)  ── Unix socket, postcard ──  daemon
-   раскладка, ввод, рендер                                PTY + alacritty_terminal на сессию
-   только видимые панели                                  кадры видимых сессий, поиск,
-                                                          автосохранение state.json + scrollback
+ window (winit + wgpu + egui)  ── Unix socket, postcard ──  daemon
+   layout, input, rendering                                   a PTY + alacritty_terminal per session
+   visible panes only                                         frames of visible sessions, search,
+                                                              autosave of state.json + scrollback
 ```
 
-- `src/daemon` — сессии, рассылка кадров, сохранение и восстановление.
-- `src/gui` — окно, UI, клавиатура и мышь, рендер сетки.
-- `src/model.rs` — модель страниц и дерева разбиений (общая для GUI и daemon).
-- `src/protocol.rs` — сообщения между процессами.
+- `src/daemon`: sessions, sending frames, saving and restoring.
+- `src/gui`: the window, UI, keyboard and mouse, drawing the grid.
+- `src/model.rs`: pages and the split tree (shared by the window and the daemon).
+- `src/protocol.rs`: messages between the processes.
+- `src/sys.rs`: what differs between macOS/Linux and Windows.
 
-Тесты: `cargo test` (юнит-тесты и e2e: настоящий daemon, шелл, `kill -9` и восстановление).
+Tests: `cargo test` (unit tests and end-to-end tests with a real daemon, shell, `kill -9` and
+restore).
 
-## Что дальше
+## Next
 
-- Windows (ConPTY уже поддерживается `alacritty_terminal`, нужен транспорт вместо Unix-сокета).
-- Перезапуск программ после восстановления (например, `claude --resume`). Сейчас
-  восстанавливаются папка, история и раскладка, а сами процессы — нет.
-- Отображение IME-предредактирования для китайского и японского ввода.
-- `⌘`+клик по путям вида `src/main.rs:42` с открытием в редакторе.
+- Showing IME pre-edit text for Chinese and Japanese input.
+- `⌘`+click on paths like `src/main.rs:42` to open them in an editor.
