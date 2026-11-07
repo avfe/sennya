@@ -15,6 +15,9 @@ if (Test-Path $exe) {
 }
 Copy-Item (Join-Path $From 'sennya.exe') $exe
 Copy-Item (Join-Path $From 'sennya.ico') (Join-Path $dir 'sennya.ico') -Force
+# Files from a downloaded zip are marked as coming from the internet, and the copy keeps that
+# mark; without this, SmartScreen stops the Start menu shortcut the first time.
+Unblock-File $exe
 
 $path = [Environment]::GetEnvironmentVariable('Path', 'User')
 if (-not (($path -split ';') -contains $dir)) {
@@ -33,4 +36,9 @@ $shortcut.Description = 'sennya terminal'
 $shortcut.Save()
 
 & $exe install-skill | Out-Null
-Write-Output "Installed $exe, PATH and the Start menu shortcut"
+Write-Output "Installed $exe, PATH, the Start menu shortcut and the Claude Code skill"
+if (Get-Process -Name sennya -ErrorAction SilentlyContinue) {
+    Write-Output "The sennya started before this install is still running. To move its terminals to"
+    Write-Output "the new version, run: sennya restart-daemon (they keep their folders and history;"
+    Write-Output "programs running in them stop)"
+}

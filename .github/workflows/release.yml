@@ -1,0 +1,219 @@
+# Push a tag like v0.2.0 (it must match the version in Cargo.toml) to build and publish a release.
+# Run it by hand (Actions → Release → Run workflow) for a dry run: the zips, checksums and release
+# notes are uploaded as workflow artifacts and no release is created.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read Cargo.toml and check the tag
+        id: version
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml version: $version"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version; bump Cargo.toml or tag v$version"
+            exit 1
+          fi
+
+  macos:
+    name: macOS (universal)
+    needs: version
+    runs-on: macos-latest
+    env:
+      APP: target/release/bundle.noindex/Sennya.app
+      # Same floor for both slices as LSMinimumSystemVersion in the bundle's Info.plist.
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Check Cargo.lock is up to date
+        run: cargo fetch --locked
+
+      - name: Build Sennya.app (aarch64 + x86_64, joined with lipo)
+        run: scripts/bundle-macos.sh --target aarch64-apple-darwin --target x86_64-apple-darwin
+
+      - name: Check the app
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          bin="$APP/Contents/MacOS/sennya"
+          lipo -info "$bin"
+          lipo "$bin" -verify_arch arm64 x86_64
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          plutil -lint "$APP/Contents/Info.plist"
+          test "$("$bin" --version)" = "sennya $VERSION"
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            arch -x86_64 "$bin" --version
+          else
+            echo "::notice::No Rosetta on this runner; the x86_64 slice was built but not run"
+          fi
+          # The skill ships inside the binary.
+          CLAUDE_CONFIG_DIR="$RUNNER_TEMP/claude" "$bin" install-skill
+          cmp skills/sennya/SKILL.md "$RUNNER_TEMP/claude/skills/sennya/SKILL.md"
+
+      - name: Zip Sennya.app with install.command
+        run: |
+          mkdir -p dist/Sennya
+          ditto "$APP" dist/Sennya/Sennya.app
+          cp scripts/install.command dist/Sennya/install.command
+          chmod 755 dist/Sennya/install.command
+          # --norsrc: no ._* files for extended attributes, which other unzip tools show as junk.
+          ditto -c -k --norsrc --keepParent dist/Sennya Sennya-macos-universal.zip
+          zipinfo Sennya-macos-universal.zip | grep -E 'install.command|MacOS/sennya'
+          zipinfo Sennya-macos-universal.zip Sennya/install.command | grep -q '^-rwx' || { echo "::error::install.command lost its executable bit"; exit 1; }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Sennya-macos-universal
+          path: Sennya-macos-universal.zip
+          if-no-files-found: error
+
+  windows:
+    name: Windows (x64)
+    needs: version
+    runs-on: windows-latest
+    env:
+      # Static C runtime: the exe runs without the Visual C++ redistributable.
+      RUSTFLAGS: -C target-feature=+crt-static
+      EXE: ${{ github.workspace }}\target\x86_64-pc-windows-msvc\release\sennya.exe
+    steps:
+      # The skill and the agent guide are compiled into the exe; keep them LF as in the repo.
+      - name: Keep LF line endings
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add x86_64-pc-windows-msvc
+
+      # An explicit --target keeps RUSTFLAGS off build scripts and proc macros.
+      - name: Build sennya.exe
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Check the exe
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $got = & $env:EXE --version
+          if ($got -ne "sennya $env:VERSION") { throw "sennya.exe --version printed '$got', expected 'sennya $env:VERSION'" }
+
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $dumpbin = if (Test-Path $vswhere) {
+            & $vswhere -latest -products * -find 'VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          }
+          if ($dumpbin) {
+            $dlls = & $dumpbin /nologo /dependents $env:EXE | Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim() }
+            Write-Output "sennya.exe loads: $($dlls -join ', ')"
+            $crt = $dlls | Where-Object { $_ -match 'vcruntime|msvcp|ucrtbase|api-ms-win-crt' }
+            if ($crt) { throw "sennya.exe loads the C runtime from $($crt -join ', '); it would need the VC++ redistributable" }
+          } else {
+            Write-Output '::warning::dumpbin not found; the static C runtime was not checked'
+          }
+
+          # The skill ships inside the exe.
+          $env:CLAUDE_CONFIG_DIR = Join-Path $env:RUNNER_TEMP 'claude'
+          & $env:EXE install-skill
+          $installed = Join-Path $env:CLAUDE_CONFIG_DIR 'skills\sennya\SKILL.md'
+          if ((Get-FileHash $installed).Hash -ne (Get-FileHash 'skills\sennya\SKILL.md').Hash) { throw 'the installed skill differs from skills/sennya/SKILL.md' }
+
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD\scripts\install-windows.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors | ForEach-Object { Write-Output "::error::$_" }; exit 1 }
+
+      - name: Zip sennya.exe, sennya.ico and install-windows.ps1
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item $env:EXE dist\sennya.exe
+          Copy-Item assets\icon.ico dist\sennya.ico
+          Copy-Item scripts\install-windows.ps1 dist\install-windows.ps1
+          Compress-Archive -Path dist\* -DestinationPath sennya-windows-x64.zip
+          (Get-Item sennya-windows-x64.zip).Length
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sennya-windows-x64
+          path: sennya-windows-x64.zip
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: [version, macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums and release notes
+        run: |
+          cd dist
+          sha256sum Sennya-macos-universal.zip sennya-windows-x64.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          {
+            cat ../.github/release-notes.md
+            echo
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+          } > release-notes.md
+
+      # A dry run stops here; its notes and checksums are kept with the run.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: |
+            dist/release-notes.md
+            dist/SHA256SUMS.txt
+
+      - name: Publish the GitHub release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          name: sennya ${{ needs.version.outputs.version }}
+          body_path: dist/release-notes.md
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/Sennya-macos-universal.zip
+            dist/sennya-windows-x64.zip
+            dist/SHA256SUMS.txt

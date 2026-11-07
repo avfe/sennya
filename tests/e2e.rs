@@ -1,5 +1,7 @@
 //! End-to-end: a real daemon, a real shell, the real socket protocol, and a
 //! `kill -9` of the daemon followed by restoring the session from disk.
+// Unix sockets, signals and /bin/sh; on Windows this file compiles to no tests.
+#![cfg(unix)]
 
 use std::io::{BufReader, Write};
 use std::os::unix::net::UnixStream;

@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --locked
+
+      # Unit tests and tests/e2e.rs (a real daemon, shell and socket).
+      - name: Test
+        run: cargo test --locked
+
+      - name: Check the scripts
+        run: |
+          for f in scripts/bundle-macos.sh scripts/install-macos.sh scripts/install.command; do bash -n "$f"; done
+          sh -n scripts/build-windows.sh
+
+      # The release bundles the same way, from a universal binary.
+      - name: Bundle Sennya.app from the debug binary
+        run: |
+          scripts/bundle-macos.sh --binary target/debug/sennya
+          codesign --verify --deep --strict target/release/bundle.noindex/Sennya.app
+          plutil -lint target/release/bundle.noindex/Sennya.app/Contents/Info.plist
+          rm -rf target/release/bundle.noindex target/sennya.iconset
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      # Build with the LF files from the repo, as the release and the cross build do
+      # (the skill and the agent guide are compiled into the exe).
+      - name: Keep LF line endings
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      # Unit tests; tests/e2e.rs is unix-only and compiles to nothing here.
+      - name: Test
+        run: cargo test --locked
+
+      - name: Check install-windows.ps1 parses
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD\scripts\install-windows.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors | ForEach-Object { Write-Output "::error::$_" }; exit 1 }

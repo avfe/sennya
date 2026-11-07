@@ -772,6 +772,8 @@ mod tests {
         let m = ModifiersState::empty();
         assert_eq!(mouse_report(0, true, false, 4, 2, m, mode::SGR_MOUSE).unwrap(), b"\x1b[<0;5;3M");
         assert_eq!(mouse_report(0, false, false, 0, 0, m, 0).unwrap(), vec![0x1b, b'[', b'M', 35, 33, 33]);
+        // POSIX escaping; on Windows shell_escape quotes for PowerShell instead.
+        #[cfg(unix)]
         assert_eq!(shell_escape("/a b/c(1).png"), "/a\\ b/c\\(1\\).png");
     }
 }
