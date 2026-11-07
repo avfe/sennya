@@ -199,6 +199,9 @@ pub enum ClientMsg {
     Arrange { page: Option<u32>, arrange: Arrange },
     /// Hide a terminal from the grid (it keeps running) or show it again.
     SetHidden { id: SessionId, hidden: bool },
+    /// Save everything and exit, so the next daemon restores it. Unix sends SIGTERM instead,
+    /// which older daemons understand too.
+    SaveAndExit,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

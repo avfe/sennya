@@ -40,6 +40,8 @@ impl Env {
             .arg("daemon")
             .env("SENNYA_DATA_DIR", self.data())
             .env("XDG_CONFIG_HOME", self.root.join("config"))
+            // Not the real ~/.claude: the daemon installs its skill there.
+            .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
             .env("PS1", "$ ")
             .stdin(std::process::Stdio::null())
             .stdout(log.try_clone().unwrap())

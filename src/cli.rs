@@ -2,7 +2,6 @@
 //! every command prints JSON (or plain text for `read`).
 
 use std::io::{BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -13,6 +12,7 @@ use crate::client::connect_or_spawn;
 use crate::model::{SessionId, Workspace};
 use crate::paths;
 use crate::protocol::{read_msg, write_msg, ClientMsg, ServerMsg, SessionInfo, SpawnSpec, PROTOCOL_VERSION};
+use crate::sys::{self, UnixStream};
 
 pub const HELP: &str = "sennya — a fast terminal whose sessions survive restarts
 
@@ -183,6 +183,28 @@ fn print(v: serde_json::Value) {
 }
 
 /// Returns false when `cmd` is not a CLI command.
+fn skill_path() -> std::path::PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".claude"))
+        .join("skills")
+        .join("sennya")
+        .join("SKILL.md")
+}
+
+/// Install or refresh the Claude Code skill when Claude Code is set up for this user, so
+/// every account and server that runs sennya gets it. Returns the path when it wrote one.
+pub fn sync_skill() -> std::io::Result<Option<std::path::PathBuf>> {
+    let path = skill_path();
+    let claude_dir = path.ancestors().nth(3).unwrap_or(&path);
+    if !claude_dir.is_dir() || std::fs::read_to_string(&path).is_ok_and(|s| s == CLAUDE_SKILL) {
+        return Ok(None);
+    }
+    std::fs::create_dir_all(path.parent().unwrap_or(&path))?;
+    std::fs::write(&path, CLAUDE_SKILL)?;
+    Ok(Some(path))
+}
+
 pub fn run(cmd: &str, mut args: Vec<String>) -> Result<bool> {
     match cmd {
         "list" | "ls" => {
@@ -253,12 +275,12 @@ pub fn run(cmd: &str, mut args: Vec<String>) -> Result<bool> {
                     line.push_str(" --dangerously-skip-permissions");
                 }
                 if let Some(m) = model {
-                    line.push_str(&format!(" --model {}", crate::template::shell_quote(&m)));
+                    line.push_str(&format!(" --model {}", crate::template::local_quote(&m)));
                 }
                 if !prompt.is_empty() && !no_submit {
                     // `--` so a prompt starting with "-" (a list, say) is not read as an option.
                     line.push_str(if prompt.starts_with('-') { " -- " } else { " " });
-                    line.push_str(&crate::template::shell_quote(&prompt));
+                    line.push_str(&crate::template::local_quote(&prompt));
                 }
                 spec.run = vec![line];
                 if no_submit && !prompt.is_empty() {
@@ -368,13 +390,8 @@ pub fn run(cmd: &str, mut args: Vec<String>) -> Result<bool> {
             None => bail!("usage: sennya remote HOST | sennya remote install HOST"),
         },
         "install-skill" => {
-            let dir = std::env::var_os("CLAUDE_CONFIG_DIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".claude"))
-                .join("skills")
-                .join("sennya");
-            std::fs::create_dir_all(&dir)?;
-            let path = dir.join("SKILL.md");
+            let path = skill_path();
+            std::fs::create_dir_all(path.parent().unwrap_or(&path))?;
             std::fs::write(&path, CLAUDE_SKILL)?;
             print(json!({ "ok": true, "path": path }));
         }
@@ -451,12 +468,10 @@ pub fn run(cmd: &str, mut args: Vec<String>) -> Result<bool> {
                     }
                 }
             };
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
-            }
+            crate::client::stop_daemon_for_restart(pid)?;
             let mut gone = false;
             for _ in 0..300 {
-                if unsafe { libc::kill(pid as i32, 0) } != 0 {
+                if !sys::process_alive(pid) {
                     gone = true;
                     break;
                 }

@@ -1,20 +1,18 @@
 //! Reaching the daemon: start it when needed, and bridge it over stdio for remote use.
 
-use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
 use crate::paths;
 use crate::protocol::{write_msg, ClientMsg};
+use crate::sys::{self, UnixStream};
 
 /// Start a helper program (a notification, `open`, another window) and reap it when it
 /// exits, so finished helpers do not pile up as zombie processes.
 pub fn spawn_detached(cmd: &mut Command) -> io::Result<()> {
+    sys::hide_console(cmd);
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
     thread::spawn(move || {
         let _ = child.wait();
@@ -25,17 +23,11 @@ pub fn spawn_detached(cmd: &mut Command) -> io::Result<()> {
 pub fn spawn_daemon() -> io::Result<()> {
     paths::ensure_private_dir(&paths::data_dir())?;
     let exe = std::env::current_exe()?;
-    let log = OpenOptions::new().create(true).append(true).mode(0o600).open(paths::log_file())?;
+    let log = sys::private_file().create(true).append(true).open(paths::log_file())?;
     let mut cmd = Command::new(exe);
     cmd.arg("daemon").stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
-    unsafe {
-        // Own session: the daemon must not die with the GUI or the terminal that started it.
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    let mut child = cmd.spawn()?;
+    // The daemon must not die with the GUI or the terminal that started it.
+    let mut child = sys::spawn_background(&mut cmd)?;
     thread::spawn(move || {
         let _ = child.wait();
     });
@@ -57,6 +49,16 @@ pub fn connect_or_spawn() -> io::Result<UnixStream> {
         }
     }
     Err(last_err)
+}
+
+/// Ask the daemon `pid` to save everything and exit, so the next one restores it.
+pub fn stop_daemon_for_restart(pid: u32) -> io::Result<()> {
+    if sys::terminate(pid) {
+        return Ok(());
+    }
+    let mut stream = UnixStream::connect(paths::socket_path())?;
+    write_msg(&mut stream, &ClientMsg::SaveAndExit)?;
+    stream.flush()
 }
 
 /// `sennya kill`: stop the daemon and every shell.

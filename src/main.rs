@@ -2,6 +2,16 @@ use sennya::{cli, client, daemon};
 
 #[cfg(feature = "gui")]
 fn window() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    unsafe {
+        // Started from the Start menu, the console is ours alone and only gets in the way.
+        // Started from a shell, it is the shell's and stays.
+        use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+        let mut pids = [0u32; 2];
+        if GetConsoleProcessList(pids.as_mut_ptr(), 2) == 1 {
+            FreeConsole();
+        }
+    }
     sennya::gui::run()
 }
 

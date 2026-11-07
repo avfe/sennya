@@ -85,6 +85,10 @@ impl Runner {
                 .with_position(PhysicalPosition::new(s.x + offset, s.y + offset))
                 .with_maximized(s.maximized && offset == 0);
         }
+        #[cfg(not(target_os = "macos"))]
+        {
+            attrs = attrs.with_window_icon(window_icon());
+        }
         #[cfg(target_os = "macos")]
         {
             use winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS};
@@ -317,6 +321,22 @@ fn watch_config(proxy: winit::event_loop::EventLoopProxy<UserEvent>) {
             }
         }
     });
+}
+
+/// The app icon for the title bar and taskbar.
+#[cfg(not(target_os = "macos"))]
+fn window_icon() -> Option<winit::window::Icon> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(&include_bytes!("../../assets/icon-256.png")[..]));
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    buf.truncate(info.buffer_size());
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => buf,
+        png::ColorType::Rgb => buf.chunks(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
+        _ => return None,
+    };
+    winit::window::Icon::from_rgba(rgba, info.width, info.height).ok()
 }
 
 pub fn run() -> anyhow::Result<()> {

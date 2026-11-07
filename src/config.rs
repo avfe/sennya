@@ -126,7 +126,7 @@ pub struct FontConfig {
 
 impl Default for FontConfig {
     fn default() -> Self {
-        Self { family: "JetBrains Mono, SF Mono, Menlo".into(), size: 13.5, line_height: 1.25 }
+        Self { family: "JetBrains Mono, SF Mono, Menlo, Cascadia Mono, Consolas".into(), size: 13.5, line_height: 1.25 }
     }
 }
 
@@ -273,7 +273,7 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            default_mode: ModeCfg::Tabs,
+            default_mode: ModeCfg::Grid,
             sidebar_width: 230.0,
             pane_gap: 1.0,
             padding: 8.0,
@@ -304,7 +304,7 @@ pub const DEFAULT_CONFIG: &str = r##"# sennya configuration. Changes are picked 
 
 [font]
 # Comma separated list, the first family found in the system font folders wins.
-family = "JetBrains Mono, SF Mono, Menlo"
+family = "JetBrains Mono, SF Mono, Menlo, Cascadia Mono, Consolas"
 size = 13.5
 line_height = 1.25
 
@@ -353,7 +353,7 @@ interval_secs = 15
 resume_claude = true        # reopen Claude Code chats after a restart
 
 [ui]
-default_mode = "tabs"       # tabs | grid
+default_mode = "grid"       # grid | tabs
 sidebar_width = 230
 pane_gap = 1                # hairline between panes
 padding = 8                 # space between a pane's edge and its text

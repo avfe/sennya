@@ -271,6 +271,11 @@ fn default_bindings() -> Vec<(&'static str, Action)> {
         (if mac { "cmd+shift+n" } else { "ctrl+shift+alt+n" }, NewWindow),
         (if mac { "cmd+ctrl+f" } else { "f11" }, FocusMode),
     ];
+    if cfg!(windows) {
+        // As in Windows Terminal: Ctrl+C copies a selection and is ^C otherwise.
+        v.push(("ctrl+c", Copy));
+        v.push(("ctrl+v", Paste));
+    }
     let digits = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
     for (i, d) in digits.iter().enumerate() {
         let chord: &'static str = if mac {
@@ -707,6 +712,9 @@ pub fn paste_bytes(text: &str, term_mode: u32) -> Vec<u8> {
 
 /// Escape a path the way Terminal.app/iTerm2 do for drag & drop.
 pub fn shell_escape(path: &str) -> String {
+    if cfg!(windows) {
+        return crate::template::local_word(path);
+    }
     let mut out = String::with_capacity(path.len() + 8);
     for c in path.chars() {
         if " \t\\'\"()[]{}<>|&;$`!*?#~=%".contains(c) {

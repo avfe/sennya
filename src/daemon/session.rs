@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
+#[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -143,6 +144,8 @@ pub struct Session {
     pub term: Arc<FairMutex<Term<Listener>>>,
     pub tx: EventLoopSender,
     pub pid: u32,
+    /// The PTY master, for asking which process group is in the foreground.
+    #[cfg(unix)]
     master: OwnedFd,
     pub meta: Mutex<Meta>,
     /// New output since the last scrollback snapshot.
@@ -219,11 +222,22 @@ impl Session {
             .map(PathBuf::from)
             .or_else(dirs::home_dir);
         let cwd_string = cwd.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-        let pty_opts = tty::Options { shell, working_directory: cwd, drain_on_exit: false, env };
+        let pty_opts = tty::Options {
+            shell,
+            working_directory: cwd,
+            drain_on_exit: false,
+            env,
+            #[cfg(windows)]
+            escape_args: true,
+        };
         let window = WindowSize { num_lines: rows, num_cols: cols, cell_width: 8, cell_height: 16 };
         let pty = tty::new(&pty_opts, window, opts.id)?;
+        #[cfg(unix)]
         let pid = pty.child().id();
+        #[cfg(unix)]
         let master = pty.file().as_fd().try_clone_to_owned()?;
+        #[cfg(windows)]
+        let pid = pty.child_watcher().pid().map(|p| p.get()).unwrap_or(0);
         let event_loop = EventLoop::new(term.clone(), listener, pty, false, false)?;
         let tx = event_loop.channel();
         event_loop.spawn();
@@ -233,6 +247,7 @@ impl Session {
             term,
             tx,
             pid,
+            #[cfg(unix)]
             master,
             meta: Mutex::new(Meta {
                 osc_title: String::new(),
@@ -280,7 +295,10 @@ impl Session {
     /// changes, so look at the terminal's foreground process instead: the shell itself
     /// while it waits for input, otherwise the program it runs.
     pub fn poll_process(&self) -> bool {
+        #[cfg(unix)]
         let fg = procinfo::foreground_pid(self.master.as_raw_fd());
+        #[cfg(windows)]
+        let fg = procinfo::foreground_pid(self.pid as i32);
         let cwd = fg.and_then(procinfo::cwd).or_else(|| procinfo::cwd(self.pid as i32));
         let process = match fg {
             Some(fg) if fg != self.pid as i32 => {

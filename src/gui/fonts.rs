@@ -15,6 +15,13 @@ fn font_dirs() -> Vec<PathBuf> {
         dirs.push(home.join(".local/share/fonts"));
         dirs.push(home.join(".fonts"));
     }
+    if cfg!(windows) {
+        let windir = std::env::var_os("WINDIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("C:\\Windows"));
+        dirs.push(windir.join("Fonts"));
+        if let Some(local) = dirs::data_local_dir() {
+            dirs.push(local.join("Microsoft\\Windows\\Fonts"));
+        }
+    }
     for d in [
         "/Library/Fonts",
         "/System/Library/Fonts",
@@ -49,11 +56,26 @@ fn norm(s: &str) -> String {
     s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
 }
 
+/// Windows names some font files with 8.3-style stems: (family, regular, bold).
+const SHORT_NAMES: &[(&str, &str, &str)] =
+    &[("consolas", "consola", "consolab"), ("couriernew", "cour", "courbd"), ("lucidaconsole", "lucon", "")];
+
 /// (file, face index) of the regular and bold faces of `family`.
 fn find_family(family: &str, files: &[PathBuf]) -> Option<((PathBuf, u32), Option<(PathBuf, u32)>)> {
     let fam = norm(family);
     if fam.is_empty() {
         return None;
+    }
+    if let Some((_, reg, bold)) = SHORT_NAMES.iter().find(|(f, _, _)| *f == fam) {
+        let by_stem = |stem: &str| {
+            (!stem.is_empty())
+                .then(|| files.iter().find(|p| p.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.eq_ignore_ascii_case(stem))))
+                .flatten()
+                .map(|p| (p.clone(), 0))
+        };
+        if let Some(regular) = by_stem(reg) {
+            return Some((regular, by_stem(bold)));
+        }
     }
     let mut regular = None;
     let mut bold = None;
@@ -109,7 +131,7 @@ pub fn install(ctx: &egui::Context, families: &str) -> Option<String> {
         defs.families.insert(FontFamily::Name(BOLD_FAMILY.into()), mono);
     }
     // The system UI font for everything that is not terminal text.
-    for path in ["/System/Library/Fonts/SFNS.ttf", "/System/Library/Fonts/HelveticaNeue.ttc"] {
+    for path in ["/System/Library/Fonts/SFNS.ttf", "/System/Library/Fonts/HelveticaNeue.ttc", "C:\\Windows\\Fonts\\segoeui.ttf"] {
         if let Some(data) = Path::new(path).exists().then(|| load(Path::new(path), 0)).flatten() {
             defs.font_data.insert("ui".into(), data);
             defs.families.entry(FontFamily::Proportional).or_default().insert(0, "ui".into());
@@ -120,6 +142,8 @@ pub fn install(ctx: &egui::Context, families: &str) -> Option<String> {
     for (name, path) in [
         ("fallback-symbols", "/System/Library/Fonts/Apple Symbols.ttf"),
         ("fallback-menlo", "/System/Library/Fonts/Menlo.ttc"),
+        ("fallback-segoe-symbols", "C:\\Windows\\Fonts\\seguisym.ttf"),
+        ("fallback-consolas", "C:\\Windows\\Fonts\\consola.ttf"),
     ] {
         if let Some(data) = Path::new(path).exists().then(|| load(Path::new(path), 0)).flatten() {
             defs.font_data.insert(name.into(), data);

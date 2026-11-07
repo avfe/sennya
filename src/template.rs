@@ -65,7 +65,10 @@ pub fn local_time(unix: i64) -> (i32, u32, u32, u32, u32, u32) {
     unsafe {
         let t: libc::time_t = unix as libc::time_t;
         let mut tm: libc::tm = std::mem::zeroed();
+        #[cfg(unix)]
         libc::localtime_r(&t, &mut tm);
+        #[cfg(windows)]
+        libc::localtime_s(&mut tm, &t);
         (tm.tm_year + 1900, tm.tm_mon as u32 + 1, tm.tm_mday as u32, tm.tm_hour as u32, tm.tm_min as u32, tm.tm_sec as u32)
     }
 }
@@ -172,6 +175,35 @@ pub fn shell_word(s: &str) -> String {
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
     }
+}
+
+/// Quote for the shell a sennya terminal starts in: POSIX on unix, PowerShell on Windows.
+/// Both read single quotes literally; PowerShell writes a quote inside them as `''`.
+pub fn local_quote(s: &str) -> String {
+    if !cfg!(windows) || s.is_empty() {
+        return shell_quote(s);
+    }
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// `local_quote`, but only when the value needs it.
+pub fn local_word(s: &str) -> String {
+    if !cfg!(windows) {
+        return shell_word(s);
+    }
+    // PowerShell gives `,` `@` `%` `=` meanings of their own, so fewer characters are plain.
+    let plain = !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:\\".contains(c));
+    if plain {
+        s.to_string()
+    } else {
+        local_quote(s)
+    }
+}
+
+/// `cd DIR`, then `cmd`, typed into a terminal's shell (PowerShell 5 has no `&&`).
+pub fn cd_then(dir: &str, cmd: &str) -> String {
+    let sep = if cfg!(windows) { ";" } else { " &&" };
+    format!("cd {}{sep} {cmd}", local_word(dir))
 }
 
 /// `~/x` -> `/Users/me/x`.

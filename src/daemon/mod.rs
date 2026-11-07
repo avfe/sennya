@@ -8,9 +8,6 @@ pub mod session;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufReader, BufWriter, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -26,6 +23,7 @@ use crate::config::{Config, ModeCfg, Step};
 use crate::model::{Dir, SessionId, ViewMode, Workspace};
 use crate::paths;
 use crate::protocol::{read_msg, write_msg, ClientMsg, Frame, FrameDelta, ServerMsg, SpawnSpec, PROTOCOL_VERSION};
+use crate::sys::{self, UnixListener, UnixStream};
 use crate::template::{self, Template};
 use session::{Session, SpawnOpts};
 
@@ -124,12 +122,14 @@ fn now_secs() -> u64 {
 
 #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
 fn peer_is_same_user(stream: &UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
     let (mut uid, mut gid) = (0, 0);
     unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) == 0 && uid == libc::geteuid() }
 }
 
 #[cfg(target_os = "linux")]
 fn peer_is_same_user(stream: &UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     let ok = unsafe {
@@ -144,17 +144,21 @@ fn peer_is_same_user(stream: &UnixStream) -> bool {
     ok && cred.uid == unsafe { libc::geteuid() }
 }
 
+/// Windows checks access to the socket file itself, which lives in the user's profile.
+#[cfg(windows)]
+fn peer_is_same_user(_stream: &UnixStream) -> bool {
+    true
+}
+
 pub fn run() -> anyhow::Result<()> {
     paths::ensure_private_dir(&paths::data_dir())?;
     paths::ensure_private_dir(&paths::scrollback_dir())?;
     paths::ensure_socket_dir()?;
     // Only one daemon at a time, even when several clients start one at the same moment.
-    let lock_file = fs::OpenOptions::new().create(true).truncate(false).write(true).open(paths::data_dir().join("daemon.lock"))?;
-    if unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    let Some(_lock) = sys::try_lock(&paths::data_dir().join("daemon.lock"))? else {
         log!("another daemon is already running");
         return Ok(());
-    }
-    let _lock = lock_file;
+    };
     let sock = paths::socket_path();
     if UnixStream::connect(&sock).is_ok() {
         log!("daemon already running");
@@ -162,7 +166,7 @@ pub fn run() -> anyhow::Result<()> {
     }
     let _ = fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock)?;
-    fs::set_permissions(&sock, fs::Permissions::from_mode(0o600))?;
+    sys::make_private_file(&sock)?;
 
     scrub_env();
     if let Some(home) = dirs::home_dir() {
@@ -171,6 +175,11 @@ pub fn run() -> anyhow::Result<()> {
     let (config, config_error) = Config::load();
     if let Some(err) = &config_error {
         log!("{err}");
+    }
+    match crate::cli::sync_skill() {
+        Ok(Some(path)) => log!("installed the Claude Code skill at {}", path.display()),
+        Ok(None) => {}
+        Err(err) => log!("could not install the Claude Code skill: {err}"),
     }
     let mode = match config.ui.default_mode {
         ModeCfg::Tabs => ViewMode::Tabs,
@@ -206,12 +215,15 @@ pub fn run() -> anyhow::Result<()> {
     thread::Builder::new().name("pump".into()).spawn(move || d.pump())?;
     let d = daemon.clone();
     thread::Builder::new().name("housekeeping".into()).spawn(move || d.housekeeping())?;
+    #[cfg(unix)]
     let d = daemon.clone();
+    #[cfg(unix)]
     let mut signals = signal_hook::iterator::Signals::new([
         signal_hook::consts::SIGTERM,
         signal_hook::consts::SIGINT,
         signal_hook::consts::SIGHUP,
     ])?;
+    #[cfg(unix)]
     thread::Builder::new().name("signals".into()).spawn(move || {
         if let Some(sig) = signals.forever().next() {
             log!("signal {sig}: saving and exiting");
@@ -536,6 +548,12 @@ impl Daemon {
                 }
                 self.broadcast(self.state_msg());
             }
+            ClientMsg::SaveAndExit => {
+                log!("restart requested: saving and exiting");
+                self.save_all();
+                let _ = fs::remove_file(paths::socket_path());
+                std::process::exit(0);
+            }
             ClientMsg::Shutdown => {
                 log!("shutdown requested: closing every session");
                 self.shutting_down.store(true, Ordering::SeqCst);
@@ -751,12 +769,12 @@ impl Daemon {
                 return;
             }
             m.claude_hibernated = false;
-            let mut parts = vec!["claude".to_string(), "--resume".into(), crate::template::shell_word(&m.claude)];
-            parts.extend(m.claude_flags.iter().map(|f| crate::template::shell_word(f)));
+            let mut parts = vec!["claude".to_string(), "--resume".into(), crate::template::local_word(&m.claude)];
+            parts.extend(m.claude_flags.iter().map(|f| crate::template::local_word(f)));
             // Claude finds a chat through its project folder, so resume from there.
             let chat_cwd = self.claude.lock().unwrap().find(&m.claude).map(|c| c.cwd).filter(|c| !c.is_empty());
             match chat_cwd {
-                Some(dir) if dir != m.cwd => format!("cd {} && {}", crate::template::shell_word(&dir), parts.join(" ")),
+                Some(dir) if dir != m.cwd => crate::template::cd_then(&dir, &parts.join(" ")),
                 _ => parts.join(" "),
             }
         };

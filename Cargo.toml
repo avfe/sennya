@@ -22,9 +22,23 @@ pollster = { version = "1.0.1", optional = true }
 postcard = { version = "1.1.3", features = ["use-std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-signal-hook = "0.4.5"
 toml = "1.1.8"
 winit = { version = "0.30.13", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.4.5"
+
+[target.'cfg(windows)'.dependencies]
+uds_windows = "1.1.0"
+windows-sys = { version = "0.59.0", features = [
+    "Wdk_System_Threading",
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
 
 [profile.release]
 opt-level = 3

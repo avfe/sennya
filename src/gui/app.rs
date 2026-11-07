@@ -617,6 +617,12 @@ impl App {
         self.clipboard.as_mut()
     }
 
+    /// Whether the visible part of a terminal has selected text.
+    fn has_selection(&self, sid: SessionId) -> bool {
+        let selected = |f: &Frame| f.lines.iter().any(|l| l.runs.iter().any(|r| r.flags & crate::protocol::flags::SELECTED != 0));
+        self.sessions.get(&sid).and_then(|s| s.frame.as_deref()).is_some_and(selected)
+    }
+
     fn mode_of(&self, sid: SessionId) -> u32 {
         self.sessions.get(&sid).and_then(|s| s.frame.as_ref()).map(|f| f.mode).unwrap_or(0)
     }
@@ -1021,8 +1027,15 @@ impl App {
             if egui_kb && (!command || matches!(action, Action::Copy | Action::Paste | Action::SelectAll)) {
                 return None;
             }
-            self.do_action(action);
-            return Some(true);
+            // Plain Ctrl+C with nothing selected is the interrupt key, not Copy.
+            let interrupt = action == Action::Copy
+                && self.modifiers.control_key()
+                && !self.modifiers.shift_key()
+                && !self.ws.focused().is_some_and(|sid| self.has_selection(sid));
+            if !interrupt {
+                self.do_action(action);
+                return Some(true);
+            }
         }
         // G1: an inline rename only takes keys while its field really has focus (egui_kb).
         if egui_kb
@@ -1190,7 +1203,9 @@ impl App {
                 let path = paths::config_file();
                 #[cfg(target_os = "macos")]
                 let ok = crate::client::spawn_detached(std::process::Command::new("open").arg("-t").arg(&path)).is_ok();
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(windows)]
+                let ok = crate::client::spawn_detached(std::process::Command::new("notepad").arg(&path)).is_ok();
+                #[cfg(not(any(target_os = "macos", windows)))]
                 let ok = crate::client::spawn_detached(std::process::Command::new("xdg-open").arg(&path)).is_ok();
                 if !ok {
                     self.toast(format!("Config: {}", path.display()));
@@ -1204,7 +1219,7 @@ impl App {
                 }
                 if let Some(sid) = focused {
                     let text = self.ws.names.get(&sid).cloned().unwrap_or_else(|| self.title_of(sid));
-                    self.rename = Some(Rename { place: RenamePlace::Sidebar, target: RenameTarget::Session(sid), text, focus: true });
+                    self.start_rename(Rename { place: RenamePlace::Sidebar, target: RenameTarget::Session(sid), text, focus: true });
                 }
             }
             Action::ScrollPageUp | Action::ScrollPageDown | Action::ScrollTop | Action::ScrollBottom => {
@@ -1270,6 +1285,9 @@ impl App {
 
     /// A system notification (and a dock bounce) while the window is in the background.
     fn notify(&self, title: &str, body: &str) {
+        // Elsewhere the taskbar flash below is the notification.
+        #[cfg(not(target_os = "macos"))]
+        let _ = (title, body);
         if self.window_focused || !self.config.ui.notifications {
             return;
         }
@@ -1393,6 +1411,13 @@ impl App {
 
     /// Show the inline name editor for `target` (if it is the one being renamed) inside `rect`.
     /// Returns true while editing, so the caller skips drawing the plain name.
+    /// A rename starts after its field was laid out this frame (a double-click on it), so it
+    /// counts as drawn until the next frame shows whether the field is on screen.
+    fn start_rename(&mut self, rename: Rename) {
+        self.rename = Some(rename);
+        self.rename_drawn = true;
+    }
+
     fn inline_rename(&mut self, ui: &mut Ui, rect: Rect, target: &RenameTarget, place: RenamePlace) -> bool {
         self.rename_drawn |= self.rename.as_ref().is_some_and(|r| r.place == place && same_target(&r.target, target));
         let same_place = self.rename.as_ref().is_some_and(|r| r.place == place);
@@ -1500,12 +1525,10 @@ impl App {
     /// which brings the terminals back in their folders with their history.
     fn restart_daemon(&mut self) {
         if let Some(pid) = self.daemon_outdated.take() {
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
-            }
+            let _ = crate::client::stop_daemon_for_restart(pid);
             // It saves everything and removes its socket; then the new daemon restores it.
             for _ in 0..100 {
-                if unsafe { libc::kill(pid as i32, 0) } != 0 {
+                if !crate::sys::process_alive(pid) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -2143,7 +2166,7 @@ impl App {
             }
         }
         if resp.double_clicked() {
-            self.rename = Some(Rename { place: RenamePlace::Sidebar, target: RenameTarget::Page(page_id), text: name.to_string(), focus: true });
+            self.start_rename(Rename { place: RenamePlace::Sidebar, target: RenameTarget::Page(page_id), text: name.to_string(), focus: true });
         }
         let sids = sids.to_vec();
         resp.context_menu(|ui| {
@@ -2167,7 +2190,7 @@ impl App {
                 ui.close();
             }
             if ui.button("Rename page").clicked() {
-                self.rename = Some(Rename { place: RenamePlace::Sidebar, target: RenameTarget::Page(page_id), text: name.to_string(), focus: true });
+                self.start_rename(Rename { place: RenamePlace::Sidebar, target: RenameTarget::Page(page_id), text: name.to_string(), focus: true });
                 ui.close();
             }
             ui.separator();
@@ -2328,7 +2351,7 @@ impl App {
             if let Some(ClaudeView { id, title, .. }) = claude {
                 let cwd = self.sessions.get(&sid).map(|s| s.info.cwd.clone()).unwrap_or_default();
                 if ui.button("Copy Claude resume command").on_hover_text(title).clicked() {
-                    let cmd = format!("cd {} && claude --resume {id}", keys::shell_escape(&cwd));
+                    let cmd = crate::template::cd_then(&cwd, &format!("claude --resume {id}"));
                     if let Some(cb) = self.clipboard() {
                         let _ = cb.set_text(cmd);
                     }
@@ -2572,11 +2595,11 @@ impl App {
                 }
             }
             if resp.double_clicked() {
-                self.rename = Some(Rename { place: RenamePlace::Tabs, target: RenameTarget::Page(page_id), text: name.clone(), focus: true });
+                self.start_rename(Rename { place: RenamePlace::Tabs, target: RenameTarget::Page(page_id), text: name.clone(), focus: true });
             }
             resp.context_menu(|ui| {
                 if ui.button("Rename page").clicked() {
-                    self.rename = Some(Rename { place: RenamePlace::Tabs, target: RenameTarget::Page(page_id), text: name.clone(), focus: true });
+                    self.start_rename(Rename { place: RenamePlace::Tabs, target: RenameTarget::Page(page_id), text: name.clone(), focus: true });
                     ui.close();
                 }
                 if ui.button(RichText::new("Close page").color(self.pal.danger)).clicked() {
@@ -3722,7 +3745,7 @@ impl App {
                             ui.close();
                         }
                         if ui.button("Copy resume command").clicked() {
-                            let cmd = format!("cd {} && claude --resume {}", keys::shell_escape(&c.cwd), c.id);
+                            let cmd = crate::template::cd_then(&c.cwd, &format!("claude --resume {}", c.id));
                             if let Ok(mut cb) = arboard::Clipboard::new() {
                                 let _ = cb.set_text(cmd);
                             }

@@ -2,11 +2,12 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use crate::sys;
+
 fn home() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
+    dirs::home_dir().unwrap_or_else(std::env::temp_dir)
 }
 
 /// Persistent state: socket, workspace, saved scrollback. `SENNYA_DATA_DIR` overrides it,
@@ -14,7 +15,8 @@ fn home() -> PathBuf {
 pub fn data_dir() -> PathBuf {
     match std::env::var_os("SENNYA_DATA_DIR") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => dirs::data_dir().unwrap_or_else(|| home().join(".local/share")).join("sennya"),
+        // %LOCALAPPDATA% on Windows: the socket and state must not roam between machines.
+        _ => dirs::data_local_dir().unwrap_or_else(|| home().join(".local/share")).join("sennya"),
     }
 }
 
@@ -37,23 +39,30 @@ pub fn socket_path() -> PathBuf {
     if path.as_os_str().len() < 100 {
         return path;
     }
-    let uid = unsafe { libc::geteuid() };
+    let uid = sys::user_id();
     let mut hash: u64 = 0xcbf29ce484222325;
     for b in data_dir().as_os_str().as_encoded_bytes() {
         hash = (hash ^ *b as u64).wrapping_mul(0x100000001b3);
     }
-    PathBuf::from(format!("/tmp/sennya-{uid}")).join(format!("{hash:016x}.sock"))
+    #[cfg(unix)]
+    let tmp = PathBuf::from("/tmp");
+    #[cfg(windows)]
+    let tmp = std::env::temp_dir();
+    tmp.join(format!("sennya-{uid}")).join(format!("{hash:016x}.sock"))
 }
 
 /// Create the socket's directory, refusing directories owned by someone else.
 pub fn ensure_socket_dir() -> io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
     let sock = socket_path();
-    let dir = sock.parent().unwrap_or(Path::new("/tmp"));
+    let Some(dir) = sock.parent() else { return Ok(()) };
     ensure_private_dir(dir)?;
-    let meta = fs::metadata(dir)?;
-    if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("unsafe socket directory {}", dir.display())));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(dir)?;
+        if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("unsafe socket directory {}", dir.display())));
+        }
     }
     Ok(())
 }
@@ -85,24 +94,18 @@ pub fn paste_dir() -> PathBuf {
 
 pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)?;
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+    sys::make_private_dir(dir)
 }
 
 /// Write a file atomically with 0600 permissions (scrollback may contain secrets).
 pub fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     // A unique temp name: two saves of the same file must never write into one temp file.
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = path.with_extension(format!("{}.{n}.tmp", std::process::id()));
     {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
+        let mut f = sys::private_file().write(true).create(true).truncate(true).open(&tmp)?;
         f.write_all(data)?;
         f.sync_data()?;
     }

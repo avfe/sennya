@@ -626,11 +626,7 @@ pub fn open_url(url: &str) -> bool {
     if !["http://", "https://", "file://", "ftp://", "mailto:"].iter().any(|s| lower.starts_with(s)) {
         return false;
     }
-    #[cfg(target_os = "macos")]
-    let program = "open";
-    #[cfg(not(target_os = "macos"))]
-    let program = "xdg-open";
-    crate::client::spawn_detached(std::process::Command::new(program).arg(url)).is_ok()
+    crate::client::spawn_detached(&mut crate::sys::open_command(url.as_ref())).is_ok()
 }
 
 #[cfg(test)]
